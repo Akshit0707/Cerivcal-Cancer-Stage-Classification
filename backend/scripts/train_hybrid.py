@@ -79,8 +79,8 @@ class FocalLoss(nn.Module):
         else:
             return focal_loss
 
-# Add parent directory to path
-sys.path.append(str(Path(__file__).parent))
+# Add backend directory to path (for models/ and feature_extractor.py)
+sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from models.hybrid_model import create_hybrid_model, load_hybrid_model
 from feature_extractor import extract_medical_features

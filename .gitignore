@@ -1,24 +1,25 @@
 # Python
 __pycache__/
 *.py[cod]
-*$py.class
-*.so
-.Python
-venv/
-env/
-ENV/
+.DS_Store
 *.egg-info/
 dist/
 build/
+.pytest_cache/
+.coverage
 
 # Data
 data/
 backend/sipakmed_raw/
 *.h5
+backend/.venv/
+backend/data/
+backend/checkpoints/
+backend/*.zip
 *.pth
 *.pt
 *.ckpt
-checkpoints/
+.ipynb_checkpoints/
 logs/
 wandb/
 mlruns/
@@ -27,6 +28,7 @@ mlruns/
 
 # Node
 node_modules/
+.env
 npm-debug.log
 yarn-error.log
 .env.local
@@ -43,7 +45,6 @@ yarn-error.log
 
 # Jupyter / Python runtime
 .ipynb_checkpoints/
-.pytest_cache/
 .mypy_cache/
 .ruff_cache/
 
