@@ -38,8 +38,21 @@ for p in (SCRIPTS_DIR, BACKEND_DIR):
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
 
-from feature_extractor import extract_medical_features
-from models.hybrid_model import create_hybrid_model, load_hybrid_model
+try:
+    from backend.feature_extractor import extract_medical_features
+except Exception:
+    try:
+        from feature_extractor import extract_medical_features
+    except Exception as e:
+        raise ImportError("Could not import feature_extractor.") from e
+
+try:
+    from backend.models.hybrid_model import create_hybrid_model, load_hybrid_model
+except Exception:
+    try:
+        from models.hybrid_model import create_hybrid_model, load_hybrid_model
+    except Exception as e:
+        raise ImportError("Could not import hybrid_model.") from e
 
 NUM_TRADITIONAL_FEATURES = 30
 FEATURE_NAMES = [
