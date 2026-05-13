@@ -8,15 +8,13 @@ import random
 import sys
 import warnings
 from collections import Counter
+from sklearn.utils import class_weight
+import numpy as np
+
 from pathlib import Path
 
-import numpy as np
-from PIL import Image
-from sklearn.metrics import classification_report, confusion_matrix
-from sklearn.preprocessing import StandardScaler
-from tqdm import tqdm
-
 import torch
+from torch.utils.data.sampler import WeightedRandomSampler
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
@@ -169,20 +167,25 @@ def get_transforms(augment=True):
     if augment:
         return transforms.Compose(
             [
-                # use RandomResizedCrop to increase effective resolution + scale variability
-                transforms.RandomResizedCrop(320, scale=(0.7, 1.0), ratio=(0.9, 1.1)),
-                transforms.RandomHorizontalFlip(p=0.5),
-                transforms.RandomRotation(15),
+                # larger input for better feature extraction
+                transforms.RandomResizedCrop(384, scale=(0.6, 1.0), ratio=(0.85, 1.15)),
+                transforms.RandomHorizontalFlip(p=0.6),
+                transforms.RandomVerticalFlip(p=0.3),  # add vertical flip
+                transforms.RandomRotation(20),
                 transforms.RandomAffine(
                     degrees=0,
-                    translate=(0.08, 0.08),
-                    scale=(0.9, 1.1),
-                    shear=6,
+                    translate=(0.1, 0.1),
+                    scale=(0.85, 1.15),
+                    shear=8,
                 ),
                 transforms.ColorJitter(
-                    brightness=0.2, contrast=0.2, saturation=0.2, hue=0.06
+                    brightness=0.3,  # stronger
+                    contrast=0.3,
+                    saturation=0.3,
+                    hue=0.08,
                 ),
-                transforms.RandomGrayscale(p=0.05),
+                transforms.RandomGrayscale(p=0.08),
+                transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 0.5)),  # add blur
                 transforms.ToTensor(),
                 transforms.Normalize(
                     mean=[0.485, 0.456, 0.406],
@@ -193,7 +196,7 @@ def get_transforms(augment=True):
 
     return transforms.Compose(
         [
-            transforms.Resize((320, 320)),
+            transforms.Resize((384, 384)),
             transforms.ToTensor(),
             transforms.Normalize(
                 mean=[0.485, 0.456, 0.406],
@@ -235,7 +238,7 @@ def train_epoch(model, train_loader, optimizer, device, epoch, criterion, scaler
         labels = labels.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
-        images_mixed, labels_a, labels_b, lam = mixup_data(images, labels, alpha=0.2)
+        images_mixed, labels_a, labels_b, lam = mixup_data(images, labels, alpha=0.1)
 
         if use_amp:
             with torch.cuda.amp.autocast():
@@ -395,44 +398,42 @@ def train_hybrid_model(args):
     )
 
     class_counts = Counter([label for _, label in train_dataset.samples])
-
-    print("\nClass distribution:")
-    for cls_idx in sorted(class_counts.keys()):
-        print(f"  {train_dataset.idx_to_class[cls_idx]}: {class_counts[cls_idx]}")
-
     max_count = max(class_counts.values())
-    sample_weights = [(max_count / class_counts[label]) ** 1.0 for _, label in train_dataset.samples]
 
-    sampler = torch.utils.data.WeightedRandomSampler(
+    # AGGRESSIVE oversampling for minority classes
+    sample_weights = []
+    for _, label in train_dataset.samples:
+        # exponent 1.2 instead of 1.0 for stronger upweighting
+        weight = (max_count / class_counts[label]) ** 1.2
+        sample_weights.append(weight)
+
+    sampler = WeightedRandomSampler(
         weights=sample_weights,
-        num_samples=len(train_dataset),
-        replacement=True,
+        num_samples=len(sample_weights),
+        replacement=True
     )
 
     num_workers = args.num_workers if device.type == "cuda" else 0
     train_loader_kwargs = dict(
         dataset=train_dataset,
         batch_size=args.batch_size,
-        sampler=sampler,
+        sampler=sampler,  # USE SAMPLER not shuffle
         num_workers=num_workers,
-        pin_memory=(device.type == "cuda"),
-        persistent_workers=(num_workers > 0),
+        pin_memory=True,
     )
     train_eval_loader_kwargs = dict(
         dataset=train_eval_dataset,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=(device.type == "cuda"),
-        persistent_workers=(num_workers > 0),
+        pin_memory=True,
     )
     val_loader_kwargs = dict(
         dataset=val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=(device.type == "cuda"),
-        persistent_workers=(num_workers > 0),
+        pin_memory=True,
     )
     if num_workers > 0:
         train_loader_kwargs["prefetch_factor"] = 2
@@ -456,13 +457,11 @@ def train_hybrid_model(args):
 
     class_weights = []
     for cls_idx in sorted(class_counts.keys()):
-        weight = (max_count / class_counts[cls_idx]) ** 1.0
+        weight = (max_count / class_counts[cls_idx]) ** 1.5
         class_weights.append(weight)
-    class_weights = torch.tensor(class_weights, dtype=torch.float32, device=device)
 
-    print(f"\nClass weights: {class_weights.detach().cpu().numpy()}")
-    print("Using Focal Loss (gamma=2.5)")
-    criterion = FocalLoss(alpha=class_weights, gamma=2.5)
+    class_weights = torch.tensor(class_weights, dtype=torch.float32, device=device)
+    criterion = torch.nn.CrossEntropyLoss(weight=class_weights)
 
     lr = args.learning_rate * 2.0 if device.type == "cuda" else args.learning_rate
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01, betas=(0.9, 0.999))
