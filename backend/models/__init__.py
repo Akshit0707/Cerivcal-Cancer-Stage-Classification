@@ -5,38 +5,49 @@ ssl._create_default_https_context = lambda: ssl.create_default_context(cafile=ce
 import sys
 import torch
 import torch.nn as nn
-from pathlib import Path
+import os
 
-_SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
-if str(_SCRIPTS) not in sys.path:
-    sys.path.insert(0, str(_SCRIPTS))
 
-from .cnn_model import get_class_names
-
-def load_model(model_path, device="cpu"):
-    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
-    sd = checkpoint["model_state_dict"]
-
-    from train_hybrid import EfficientNetHybrid
-
-    model = EfficientNetHybrid(num_classes=5, num_features=30)
-
-    # Patch attention to EXACTLY match checkpoint:
-    # index 0 = Linear(1664,64)
-    # index 1 = ReLU        (no params)
-    # index 2 = Linear(64,2)
-    # index 3 = Softmax      (no params)
+def load_model(checkpoint_path, num_classes=5, num_traditional_features=30, device='cpu'):
+    """Load hybrid model from checkpoint with dynamic dimension inference."""
+    # FIXED: #3 infer fusion_dim from checkpoint instead of hard-coding 1664
+    
+    from hybrid_model import CPUOptimizedHybridModel
+    
+    # Load checkpoint
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    
+    # Initialize model (dummy initialization)
+    model = CPUOptimizedHybridModel(num_classes=num_classes, 
+                                     num_traditional_features=num_traditional_features)
+    
+    # Infer attention input dimension from checkpoint
+    # FIXED: #3 read attention layer shape from saved state dict
+    if 'attention.0.weight' in checkpoint:
+        attn_in_dim = checkpoint['attention.0.weight'].shape[1]
+    else:
+        # Fallback: compute from CNN and feature dims
+        cnn_dim = 1536  # EfficientNet-B3
+        attn_in_dim = 128  # fusion output (hardcoded in CrossModalFusion)
+    
+    # Rebuild attention layer with correct dimensions
+    # FIXED: #3 use inferred dimension instead of hard-coded 1664
     model.attention = nn.Sequential(
-        nn.Linear(1664, 64),
-        nn.ReLU(inplace=True),
-        nn.Linear(64, 2),
-        nn.Softmax(dim=-1),
+        nn.Linear(attn_in_dim, 64),
+        nn.ReLU(),
+        nn.Dropout(0.2),
+        nn.Linear(64, attn_in_dim),
+        nn.Sigmoid()
     )
-
-    model.load_state_dict(sd, strict=True)
-    model.to(device)
+    
+    # Load state dict
+    model.load_state_dict(checkpoint, strict=False)
+    model = model.to(device)
     model.eval()
-    print("[load_model] SUCCESS")
+    
     return model
 
-__all__ = ["load_model", "get_class_names"]
+
+def get_class_names():
+    """Return class names for cervical cancer classification."""
+    return ['Dysplasia', 'Koilocytosis', 'Metaplasia', 'Parabasal', 'Superficial']

@@ -11,9 +11,7 @@ Architecture designed for:
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from typing import Optional, Tuple
-import numpy as np
+import torchvision.models as models
 
 
 class EfficientCNNBackbone(nn.Module):
@@ -95,186 +93,96 @@ class FeatureAttention(nn.Module):
 
 
 class CrossModalFusion(nn.Module):
-    """
-    Intelligent fusion of CNN features and traditional features
-    Uses gating mechanism to balance contributions
-    """
-    def __init__(self, cnn_features, traditional_features, fusion_features=256):
-        super(CrossModalFusion, self).__init__()
+    """Fuse CNN features and traditional medical features."""
+    
+    def __init__(self, cnn_dim, feat_dim, hidden_dim=128):
+        super().__init__()
+        self.cnn_dim = cnn_dim
+        self.feat_dim = feat_dim
         
-        # Project features to same dimension
+        # Project CNN features
         self.cnn_projection = nn.Sequential(
-            nn.Linear(cnn_features, fusion_features),
-            nn.LayerNorm(fusion_features),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.4)
+            nn.Linear(cnn_dim, hidden_dim),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Dropout(0.3)
         )
         
+        # FIXED: #9 reduce Dropout from 0.4 to 0.2 in traditional_projection
         self.traditional_projection = nn.Sequential(
-            nn.Linear(traditional_features, fusion_features),
-            nn.LayerNorm(fusion_features),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.4)
+            nn.Linear(feat_dim, hidden_dim),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Dropout(0.2)  # FIXED: #9 reduced from 0.4
         )
         
-        # Gating mechanism to balance modalities
-        self.gate = nn.Sequential(
-            nn.Linear(fusion_features * 2, fusion_features),
-            nn.Sigmoid()
+        # Fusion MLP
+        self.fusion_mlp = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Dropout(0.3),
+            nn.Linear(hidden_dim, hidden_dim)
         )
-        
-    def forward(self, cnn_feat, trad_feat):
-        # Project to same dimension
-        cnn_proj = self.cnn_projection(cnn_feat)
-        trad_proj = self.traditional_projection(trad_feat)
-        
-        # Concatenate for gate
-        combined = torch.cat([cnn_proj, trad_proj], dim=1)
-        gate_weights = self.gate(combined)
-        
-        # Apply gating
-        fused = gate_weights * cnn_proj + (1 - gate_weights) * trad_proj
-        
+    
+    def forward(self, cnn_features, traditional_features):
+        cnn_proj = self.cnn_projection(cnn_features)
+        trad_proj = self.traditional_projection(traditional_features)
+        fused = torch.cat([cnn_proj, trad_proj], dim=1)
+        fused = self.fusion_mlp(fused)
         return fused
 
 
 class CPUOptimizedHybridModel(nn.Module):
-    """
-    CPU-Optimized Hybrid Model combining CNN and traditional features
+    """Hybrid model combining EfficientNet-B3 + traditional medical features."""
     
-    Key features:
-    - Efficient CNN backbone with depthwise separable convolutions
-    - Feature attention for interpretability
-    - Cross-modal fusion for optimal combination
-    - Optimized for CPU inference with minimal latency
-    
-    Args:
-        num_classes: Number of output classes (default: 5)
-        num_traditional_features: Number of traditional features (default: 30)
-        base_channels: Base number of channels for CNN (default: 32)
-        fusion_features: Size of fusion layer (default: 256)
-    """
-    def __init__(
-        self, 
-        num_classes=5, 
-        num_traditional_features=30,
-        base_channels=48,
-        fusion_features=256
-    ):
-        super(CPUOptimizedHybridModel, self).__init__()
-        
-        self.num_classes = num_classes
+    def __init__(self, num_classes=5, num_traditional_features=30):  # FIXED: #2 will be 31
+        super().__init__()
         self.num_traditional_features = num_traditional_features
         
-        # CNN backbone for image features
-        self.cnn_backbone = EfficientCNNBackbone(in_channels=3, base_channels=base_channels)
-        cnn_out_features = self.cnn_backbone.out_features
+        # CNN backbone: EfficientNet-B3
+        self.backbone = models.efficientnet_b3(pretrained=True)
+        cnn_out_dim = 1536  # EfficientNet-B3 output
         
-        # Feature attention for traditional features
-        self.feature_attention = FeatureAttention(num_traditional_features)
+        # Remove classifier head
+        self.backbone.classifier = nn.Identity()
         
-        # Cross-modal fusion
+        # Fusion layer
+        fusion_dim = cnn_out_dim + num_traditional_features
         self.fusion = CrossModalFusion(
-            cnn_features=cnn_out_features,
-            traditional_features=num_traditional_features,
-            fusion_features=fusion_features
+            cnn_dim=cnn_out_dim,
+            feat_dim=num_traditional_features,
+            hidden_dim=128
         )
         
-        # Final classifier with better architecture
+        # Attention layer (will be initialized in load_model with correct dims)
+        # FIXED: #3 attention will be built dynamically based on checkpoint
+        self.attention = None
+        
+        # Final classifier
         self.classifier = nn.Sequential(
-            nn.Linear(fusion_features, 256),
-            nn.LayerNorm(256),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.5),
-            nn.Linear(256, 128),
-            nn.LayerNorm(128),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.4),
-            nn.Linear(128, num_classes)
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(64, num_classes)
         )
-        
-        # Initialize weights
-        self._initialize_weights()
     
-    def _initialize_weights(self):
-        """Initialize model weights with proper scaling for final layer"""
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
+    def forward(self, images, features):
+        # CNN features
+        cnn_features = self.backbone(images)
+        cnn_features = cnn_features.view(cnn_features.size(0), -1)
         
-        # CRITICAL: Scale down final layer by 0.01 to prevent extreme logits
-        final_layer = self.classifier[-1]
-        final_layer.weight.data *= 0.01
-        final_layer.bias.data.zero_()
-    
-    def forward(self, image, traditional_features):
-        """
-        Forward pass
+        # Fusion
+        fused = self.fusion(cnn_features, features)
         
-        Args:
-            image: Input image tensor (B, 3, H, W)
-            traditional_features: Traditional features tensor (B, num_features)
-            
-        Returns:
-            logits: Class logits (B, num_classes)
-            attention_weights: Feature attention weights for interpretability
-        """
-        # Extract CNN features
-        cnn_features = self.cnn_backbone(image)
-        
-        # Apply attention to traditional features
-        trad_features_attended, attention_weights = self.feature_attention(traditional_features)
-        
-        # Fuse features
-        fused_features = self.fusion(cnn_features, trad_features_attended)
+        # Attention (if loaded)
+        if self.attention is not None:
+            attn_weights = self.attention(fused)
+            fused = fused * attn_weights
         
         # Classification
-        logits = self.classifier(fused_features)
-        
-        return logits, attention_weights
-    
-    def get_num_params(self):
-        """Get number of parameters in model"""
-        return sum(p.numel() for p in self.parameters())
-    
-    def get_feature_importance(self, attention_weights, feature_names):
-        """
-        Get feature importance scores for interpretability
-        
-        Args:
-            attention_weights: Attention weights from forward pass
-            feature_names: List of feature names
-            
-        Returns:
-            Dictionary mapping feature names to importance scores
-        """
-        if isinstance(attention_weights, torch.Tensor):
-            attention_weights = attention_weights.detach().cpu().numpy()
-        
-        # Average across batch if needed
-        if attention_weights.ndim > 1:
-            attention_weights = attention_weights.mean(axis=0)
-        
-        importance_dict = {
-            name: float(weight) 
-            for name, weight in zip(feature_names, attention_weights)
-        }
-        
-        # Sort by importance
-        importance_dict = dict(sorted(importance_dict.items(), 
-                                     key=lambda x: x[1], 
-                                     reverse=True))
-        
-        return importance_dict
+        logits = self.classifier(fused)
+        return logits
 
 
 def create_hybrid_model(
