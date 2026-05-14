@@ -518,7 +518,8 @@ def build_feature_cache(image_paths, feature_scaler=None, fit_scaler=False):
     for p in image_paths:
         if feature_scaler is not None:
             scaled = feature_scaler.transform([raw[p]])[0]
-            scaled = sanitize_features(scaled)  # sanitize again after scaling
+            scaled = np.clip(scaled, -5.0, 5.0)   # cap at ±5σ — outlier images won't dominate
+            scaled = sanitize_features(scaled)     # final NaN guard after scaling
             cache[p] = scaled
         else:
             cache[p] = raw[p]
@@ -559,13 +560,39 @@ def train_hybrid_model(data_dir, output_dir, epochs=100, batch_size=32,
         return paths, lbls
 
     if train_path.exists() and val_path.exists():
-        print("✅ Pre-split train/ and val/ found — using them directly.")
+        print("✅ Pre-split train/ and val/ found.")
         class_names = sorted([p.name for p in train_path.iterdir() if p.is_dir()])
         print(f"   Classes: {class_names}")
         print("\n📂 train/")
-        train_paths, train_labels = load_split(train_path, class_names)
+        train_paths_raw, train_labels_raw = load_split(train_path, class_names)
         print("\n📂 val/")
-        val_paths, val_labels = load_split(val_path, class_names)
+        val_paths_raw, val_labels_raw = load_split(val_path, class_names)
+
+        # ── Check if the pre-made val split is badly imbalanced ──────────
+        val_counts = Counter(val_labels_raw)
+        min_val    = min(val_counts.values())
+        max_val    = max(val_counts.values())
+        imbalance_ratio = max_val / max(min_val, 1)
+
+        if imbalance_ratio > 3.0:
+            print(f"\n⚠️  Val set is severely imbalanced (max/min ratio={imbalance_ratio:.1f}x).")
+            print(f"   Class counts: { {class_names[k]: v for k,v in sorted(val_counts.items())} }")
+            print(f"   Merging train+val and re-splitting 80/20 with stratification...")
+
+            all_paths  = train_paths_raw  + val_paths_raw
+            all_labels = train_labels_raw + val_labels_raw
+            train_paths, val_paths, train_labels, val_labels = train_test_split(
+                all_paths, all_labels,
+                test_size=0.2, random_state=42, stratify=all_labels
+            )
+            print(f"\n📊 Re-split result:")
+            new_val_counts = Counter(val_labels)
+            for idx, name in enumerate(class_names):
+                print(f"   {name}: train={Counter(train_labels)[idx]}  val={new_val_counts[idx]}")
+        else:
+            train_paths, train_labels = train_paths_raw, train_labels_raw
+            val_paths,   val_labels   = val_paths_raw,   val_labels_raw
+            print("✅ Val distribution looks balanced — using pre-made split.")
     else:
         print("⚠️  No pre-split dirs found, scanning root and splitting 80/20.")
         class_names = sorted([p.name for p in data_path.iterdir()
@@ -630,8 +657,8 @@ def train_hybrid_model(data_dir, output_dir, epochs=100, batch_size=32,
     head_params     = [p for p in model.parameters() if id(p) not in backbone_param_ids]
 
     optimizer = torch.optim.AdamW([
-        {'params': backbone_params, 'lr': lr * 0.01,  'weight_decay': 1e-4},
-        {'params': head_params,     'lr': lr,          'weight_decay': 1e-4},
+        {'params': backbone_params, 'lr': lr * 0.05,  'weight_decay': 1e-4},  # 5e-6
+        {'params': head_params,     'lr': lr,          'weight_decay': 1e-4},  # 1e-4
     ])
 
     # FIX BUG 2: scheduler stepped once/epoch, stores initial_lr per group
