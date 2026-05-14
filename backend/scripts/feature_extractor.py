@@ -9,7 +9,7 @@ try:
     from skimage.feature import graycomatrix, graycoprops
 except ImportError:
     # Fallback for older versions
-    from skimage.feature import greycomatrix as graycomatrix, greycoprops
+    from skimage.feature import graycomatrix as graycomatrix, graycoprops
 
 from scipy import ndimage
 from pathlib import Path
@@ -84,10 +84,10 @@ class CellFeatureExtractor:
         
         # Extract 4 GLCM properties (not 5)
         # FIXED: #2 removed dissimilarity; keeping: contrast, correlation, energy, homogeneity
-        contrast = greycoprops(glcm, 'contrast')
-        correlation = greycoprops(glcm, 'correlation')
-        energy = greycoprops(glcm, 'energy')
-        homogeneity = greycoprops(glcm, 'homogeneity')
+        contrast = graycoprops(glcm, 'contrast')
+        correlation = graycoprops(glcm, 'correlation')
+        energy = graycoprops(glcm, 'energy')
+        homogeneity = graycoprops(glcm, 'homogeneity')
         
         return {
             'glcm_contrast': float(contrast),
