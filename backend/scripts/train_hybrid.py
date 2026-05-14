@@ -463,7 +463,7 @@ def train_hybrid_model(data_dir, output_dir, epochs=80, batch_size=16, lr=1e-3, 
     
     os.makedirs(output_dir, exist_ok=True)
     
-    # FIXED: Better data structure detection
+    # FIXED: Auto-detect class names from directory structure
     data_path = Path(data_dir)
     print(f"📁 Looking for images in: {data_path}")
     print(f"   Directory exists: {data_path.exists()}")
@@ -472,18 +472,63 @@ def train_hybrid_model(data_dir, output_dir, epochs=80, batch_size=16, lr=1e-3, 
         contents = sorted([p.name for p in data_path.iterdir()])
         print(f"   Top-level contents: {contents}")
     
-    # Class names to search for
-    class_names = ['Dysplasia', 'Koilocytosis', 'Metaplasia', 'Parabasal', 'Superficial']
+    # FIXED: Auto-detect class names from train/ or root directory
+    class_names = []
     image_paths = []
     labels = []
     
-    # FIXED: Strategy 1 - Direct class folders at root
-    has_class_dirs = all((data_path / cn).exists() for cn in class_names)
-    
-    if has_class_dirs:
-        print("✅ Detected: /data/ClassName/")
+    # Try to find where classes are located
+    train_path = data_path / 'train'
+    if train_path.exists():
+        print("✅ Found train/ directory, checking for class subdirectories...")
+        potential_classes = sorted([p.name for p in train_path.iterdir() if p.is_dir()])
+        class_names = potential_classes
+        print(f"   Auto-detected classes: {class_names}")
+        
+        # Load from train/ and val/ splits
+        for split in ['train', 'val']:
+            split_path = data_path / split
+            if not split_path.exists():
+                print(f"   ⚠️  {split}/ not found, skipping")
+                continue
+            
+            print(f"\n📂 Processing {split}/ directory:")
+            for class_idx, class_name in enumerate(class_names):
+                class_dir = split_path / class_name
+                if not class_dir.exists():
+                    print(f"     ⚠️  {class_name}/ not found in {split}/")
+                    continue
+                
+                img_files = sorted(list(class_dir.glob('*.jpg')) + list(class_dir.glob('*.JPG')) + 
+                                 list(class_dir.glob('*.png')) + list(class_dir.glob('*.PNG')))
+                print(f"     {class_name}: {len(img_files)} images")
+                
+                for img_path in img_files:
+                    image_paths.append(str(img_path))
+                    labels.append(class_idx)
+    else:
+        # Fallback: look for classes at root level
+        print("✅ No train/ found, checking root directory for class folders...")
+        # FIXED: define expected classes for this dataset
+        expected_classes = ['Dysplasia', 'Koilocytosis', 'Metaplasia', 'Parabasal', 'Superficial']
+        
+        # Auto-detect available classes
+        potential_classes = sorted([p.name for p in data_path.iterdir() 
+                                   if p.is_dir() and p.name not in ['train', 'val', 'test', 'synthetic', 'sipakmed_raw']])
+        
+        if potential_classes:
+            class_names = potential_classes
+        else:
+            class_names = expected_classes
+        
+        print(f"   Auto-detected classes: {class_names}")
+        
         for class_idx, class_name in enumerate(class_names):
             class_dir = data_path / class_name
+            if not class_dir.exists():
+                print(f"   ⚠️  {class_name}/ not found")
+                continue
+            
             img_files = sorted(list(class_dir.glob('*.jpg')) + list(class_dir.glob('*.JPG')) + 
                              list(class_dir.glob('*.png')) + list(class_dir.glob('*.PNG')))
             print(f"   {class_name}: {len(img_files)} images")
@@ -491,55 +536,6 @@ def train_hybrid_model(data_dir, output_dir, epochs=80, batch_size=16, lr=1e-3, 
             for img_path in img_files:
                 image_paths.append(str(img_path))
                 labels.append(class_idx)
-    else:
-        # FIXED: Strategy 2 - Check train/ folder first, then combine with val/
-        print("✅ Checking for train/val split structure...")
-        
-        split_dirs = ['train', 'val']
-        for split in split_dirs:
-            split_path = data_path / split
-            if not split_path.exists():
-                print(f"   ⚠️  {split}/ not found, skipping")
-                continue
-            
-            print(f"\n📂 Processing {split}/ directory:")
-            
-            # Check if class subdirs exist in split
-            split_has_classes = any((split_path / cn).exists() for cn in class_names)
-            
-            if split_has_classes:
-                print(f"   Found class subdirectories in {split}/")
-                for class_idx, class_name in enumerate(class_names):
-                    class_dir = split_path / class_name
-                    if not class_dir.exists():
-                        continue
-                    
-                    img_files = sorted(list(class_dir.glob('*.jpg')) + list(class_dir.glob('*.JPG')) + 
-                                     list(class_dir.glob('*.png')) + list(class_dir.glob('*.PNG')))
-                    print(f"     {class_name}: {len(img_files)} images")
-                    
-                    for img_path in img_files:
-                        image_paths.append(str(img_path))
-                        labels.append(class_idx)
-            else:
-                # FIXED: Look for class folders at any depth
-                print(f"   Searching for class folders at any depth in {split}/...")
-                for class_idx, class_name in enumerate(class_names):
-                    # Look recursively for folders matching class name
-                    matching_dirs = list(split_path.glob(f'**/{class_name}')) + \
-                                   list(split_path.glob(f'**/{class_name.lower()}')) + \
-                                   list(split_path.glob(f'**/*{class_name}*'))
-                    
-                    for class_dir in matching_dirs:
-                        if class_dir.is_dir():
-                            img_files = sorted(list(class_dir.glob('*.jpg')) + list(class_dir.glob('*.JPG')) + 
-                                             list(class_dir.glob('*.png')) + list(class_dir.glob('*.PNG')))
-                            if img_files:
-                                print(f"     Found {class_dir.name}: {len(img_files)} images")
-                                for img_path in img_files:
-                                    image_paths.append(str(img_path))
-                                    labels.append(class_idx)
-                            break
     
     print(f"\n✅ Total images found: {len(image_paths)}")
     
@@ -562,7 +558,7 @@ def train_hybrid_model(data_dir, output_dir, epochs=80, batch_size=16, lr=1e-3, 
         
         raise ValueError(
             f"No images found in {data_dir}. "
-            f"Expected class folders: {class_names}"
+            f"Expected structure: data/train/ClassName/ or data/ClassName/"
         )
     
     # Verify class distribution
@@ -732,6 +728,7 @@ def train_hybrid_model(data_dir, output_dir, epochs=80, batch_size=16, lr=1e-3, 
     print(f"   Best val acc: {best_val_acc:.2f}%")
     print(f"   Best macro-F1: {best_macro_f1:.4f}")
     print(f"   Checkpoint: {checkpoint_path}")
+    print(f"   Classes: {class_names}")
     print(f"{'='*70}")
     return checkpoint_path
 
