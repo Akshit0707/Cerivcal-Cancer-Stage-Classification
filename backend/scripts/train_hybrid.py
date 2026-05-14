@@ -475,7 +475,7 @@ def build_feature_cache(image_paths, feature_scaler=None, fit_scaler=False):
 # Main training
 # ─────────────────────────────────────────────────────────────────────────────
 def train_hybrid_model(data_dir, output_dir, epochs=100, batch_size=32,
-                       lr=1e-4, early_stopping_patience=20):
+                       lr=1e-4, early_stopping_patience=20, num_workers=4):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
@@ -558,7 +558,7 @@ def train_hybrid_model(data_dir, output_dir, epochs=100, batch_size=32,
     sample_weights = [class_weights[l] for l in train_labels]
     sampler = WeightedRandomSampler(sample_weights, len(train_labels), replacement=True)
 
-    num_workers = min(4, os.cpu_count() or 0)
+    num_workers = min(num_workers, os.cpu_count() or 0)
     train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=sampler,
                               num_workers=num_workers, pin_memory=True)
     val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False,
@@ -671,6 +671,7 @@ if __name__ == '__main__':
     parser.add_argument('--batch-size',             type=int,   default=32)
     parser.add_argument('--learning-rate',          type=float, default=1e-4)
     parser.add_argument('--early-stopping-patience',type=int,   default=20)
+    parser.add_argument('--num-workers',            type=int,   default=4)
     parser.add_argument('--seed',                   type=int,   default=42)
     args = parser.parse_args()
 
@@ -690,4 +691,5 @@ if __name__ == '__main__':
         batch_size=args.batch_size,
         lr=args.learning_rate,
         early_stopping_patience=args.early_stopping_patience,
+        num_workers=args.num_workers,
     )
