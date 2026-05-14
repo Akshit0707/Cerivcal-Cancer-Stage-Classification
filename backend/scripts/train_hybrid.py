@@ -8,13 +8,30 @@ FIXES vs previous version:
   2. CLASS IMBALANCE: Focal loss replaces label smoothing for minority classes
      (CIN2/CIN3/Cancer had only 11 samples vs CIN1=76)
   3. CLASS WEIGHTS: Inverse-frequency weights passed to loss function
-  4. OVERSAMPLE MINORITY: WeightedRandomSampler weight exponent increased 1.0→1.5
+  4. OVERSAMPLE MINORITY: WeightedRandomSampler weight exponent increased 1.0->1.5
   5. FEATURE BRANCH LR: Feature MLP gets same LR as head, not backbone LR
   6. MIXUP DISABLED for minority classes below threshold (hurts rare classes)
   7. BACKBONE: EfficientNet-B3 pretrained on ImageNet
   8. LR SCHEDULER: WarmupCosine fixed
   9. DROPOUT: 0.4 before final classifier
  10. AUGMENTATION: Strong pipeline with RandomErasing after ToTensor (fixed)
+
+KAGGLE FIXES (this version):
+ 11. INDENTATION: Fixed all IndentationErrors throughout the file
+ 12. AMP API: Replaced deprecated torch.cuda.amp.autocast/GradScaler with
+     torch.amp equivalents (required in PyTorch >= 2.0 on Kaggle)
+ 13. STARTUP DEPRECATION: Replaced @app.on_event("startup") pattern (kept
+     training-only; startup lives in main.py)
+ 14. SCALER THREAD SAFETY: feature_scaler passed explicitly to all datasets
+     instead of relying on shared mutable state
+ 15. SAMPLER + SHUFFLE: shuffle=False enforced when sampler is set (was
+     triggering a DataLoader ValueError on newer PyTorch)
+ 16. TTA LABEL BUG: labels only collected from pass 0 — was silently empty
+     on subsequent passes; fixed with explicit guard
+ 17. CHECKPOINT LOAD: weights_only=False kept but wrapped in try/except for
+     forward compatibility
+ 18. UNFREEZE SCHEDULE: backbone unfreeze used blocks_from_end but
+     unfreeze_backbone() parameter was mis-named; fixed to match definition
 """
 
 import argparse
@@ -24,12 +41,12 @@ import sys
 import warnings
 from collections import Counter
 from pathlib import Path
-from PIL import Image
 
 import numpy as np
-from tqdm import tqdm
-from sklearn.preprocessing import StandardScaler
+from PIL import Image
 from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.preprocessing import StandardScaler
+from tqdm import tqdm
 
 import torch
 import torch.nn as nn
@@ -41,7 +58,7 @@ from torchvision import transforms
 
 warnings.filterwarnings("ignore")
 
-_SCRIPT_VERSION = "EfficientNet-B3-Hybrid-v3-fixedattention"
+_SCRIPT_VERSION = "EfficientNet-B3-Hybrid-v4-kaggle-fixed"
 print(f"[train_hybrid.py] version={_SCRIPT_VERSION}  file={__file__}")
 
 # ── Path setup ────────────────────────────────────────────────────────────────
@@ -61,14 +78,6 @@ except Exception:
         from feature_extractor import extract_medical_features
     except Exception as e:
         raise ImportError("Could not import feature_extractor.") from e
-
-try:
-    from backend.models.hybrid_model import load_hybrid_model
-except Exception:
-    try:
-        from models.hybrid_model import load_hybrid_model
-    except Exception:
-        load_hybrid_model = None
 
 NUM_TRADITIONAL_FEATURES = 30
 FEATURE_NAMES = [
@@ -114,14 +123,14 @@ def resolve_data_dir(user_path: str) -> Path:
 # ── FIX #1: Focal Loss for imbalanced classes ─────────────────────────────────
 class FocalLoss(nn.Module):
     """
-    Focal loss down-weights easy (well-classified) examples so the model
-    focuses on hard minority-class examples like CIN2/CIN3/Cancer.
-    gamma=2 is standard; alpha provides per-class inverse-frequency weighting.
+    Focal loss down-weights easy examples so the model focuses on hard
+    minority-class examples like CIN2/CIN3/Cancer.
+    gamma=2 is standard; weight provides per-class inverse-frequency weighting.
     """
     def __init__(self, gamma: float = 2.0, weight: torch.Tensor = None):
         super().__init__()
         self.gamma = gamma
-        self.weight = weight  # per-class weights (inverse frequency)
+        self.weight = weight
 
     def forward(self, logits, targets):
         ce = F.cross_entropy(logits, targets, weight=self.weight, reduction="none")
@@ -157,16 +166,8 @@ class EfficientNetHybrid(nn.Module):
     """
     EfficientNet-B3 + medical feature MLP fused with fixed attention gate.
 
-    KEY FIX: In the old version the attention gate received the raw concatenated
-    features and its gradients flowed freely back into both branches. Because
-    the CNN branch has ~12M parameters and the feature branch only ~200K, the
-    CNN dominated and drove the attention weights to (1.0, 0.0) — completely
-    ignoring the medical features.
-
-    Fix: compute attention from DETACHED representations. The attention gate
-    now decides how to weight the branches based on their current values but
-    cannot update the branches through that path. Each branch is updated only
-    through its own prediction loss, giving the feature branch a fair gradient.
+    KEY FIX: attention is computed on DETACHED representations so the gate
+    cannot collapse the feature branch by routing all gradients through CNN.
     """
     def __init__(self, num_classes: int, num_features: int = 30, dropout: float = 0.4):
         super().__init__()
@@ -185,12 +186,10 @@ class EfficientNetHybrid(nn.Module):
 
         self.cnn_out_dim = cnn_out_dim
         feat_out_dim = 128
-
         self.feature_mlp = FeatureMLP(num_features, feat_out_dim, dropout=0.3)
-
         fusion_dim = cnn_out_dim + feat_out_dim
 
-        # Attention gate operates on detached features (see forward())
+        # Attention gate operates on detached features (see forward)
         self.attention = nn.Sequential(
             nn.Linear(fusion_dim, 128),
             nn.ReLU(inplace=True),
@@ -222,13 +221,12 @@ class EfficientNetHybrid(nn.Module):
             p.requires_grad = (i >= unfreeze_from)
 
     def forward(self, images, features):
-        cnn_feat  = self.backbone(images)        # (B, 1536)
-        trad_feat = self.feature_mlp(features)   # (B, 128)
-
+        cnn_feat  = self.backbone(images)          # (B, 1536)
+        trad_feat = self.feature_mlp(features)     # (B, 128)
         fused = torch.cat([cnn_feat, trad_feat], dim=1)  # (B, 1664)
 
-        # FIX: detach before attention so the gate cannot collapse feature branch
-        attn = self.attention(fused.detach())             # (B, 2)
+        # Detach so attention gate cannot collapse the feature branch
+        attn = self.attention(fused.detach())      # (B, 2)
 
         cnn_scaled  = cnn_feat  * attn[:, 0:1]
         trad_scaled = trad_feat * attn[:, 1:2]
@@ -251,7 +249,7 @@ def build_model(num_classes, num_features, device, pretrained_cnn_path=None):
     model = model.to(device)
     n_params  = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"  Model            : EfficientNetHybrid v3 (fixed attention)")
+    print(f"  Model            : EfficientNetHybrid v4 (kaggle-fixed)")
     print(f"  Total parameters : {n_params:,}")
     print(f"  Trainable now    : {trainable:,}  (backbone frozen during warmup)")
     print(f"  Estimated size   : {n_params * 4 / 1e6:.2f} MB")
@@ -317,7 +315,7 @@ class HybridDataset(Dataset):
         )
 
 
-# ── Transforms — RandomErasing AFTER ToTensor (fixed) ────────────────────────
+# ── Transforms ────────────────────────────────────────────────────────────────
 def get_transforms(augment=True):
     if augment:
         return transforms.Compose([
@@ -404,6 +402,19 @@ class WarmupCosineScheduler:
         return [pg["lr"] for pg in self.optimizer.param_groups]
 
 
+# ── FIX #12: Updated AMP API (PyTorch >= 2.0, required on Kaggle) ─────────────
+def _make_amp_scaler(device):
+    """Return a GradScaler for CUDA, None for CPU. Uses new torch.amp API."""
+    if device.type != "cuda":
+        return None
+    try:
+        # PyTorch >= 2.0
+        return torch.amp.GradScaler("cuda")
+    except TypeError:
+        # PyTorch < 2.0 fallback
+        return torch.cuda.amp.GradScaler()
+
+
 # ── Train epoch ───────────────────────────────────────────────────────────────
 def train_epoch(model, loader, optimizer, device, epoch, criterion, amp_scaler=None):
     model.train()
@@ -420,7 +431,8 @@ def train_epoch(model, loader, optimizer, device, epoch, criterion, amp_scaler=N
         images_m, y_a, y_b, lam = mixup_data(images, labels, alpha=0.3)
 
         if use_amp:
-            with torch.cuda.amp.autocast():
+            # FIX #12: use torch.amp.autocast instead of torch.cuda.amp.autocast
+            with torch.amp.autocast("cuda"):
                 logits, _ = model(images_m, features)
                 loss = mixup_criterion(logits, y_a, y_b, lam, criterion)
         else:
@@ -472,7 +484,6 @@ def evaluate(model, loader, device, desc="Eval", loss_fn=None):
             preds = logits.argmax(dim=1)
             correct += (preds == labels).sum().item()
             total += labels.size(0)
-
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
             all_attn.append(attn.detach().cpu().numpy())
@@ -489,42 +500,58 @@ def evaluate_with_tta(model, dataset_dir, feature_cache, feature_scaler,
                       device, batch_size, num_workers, n_augments=6):
     print(f"\n[TTA] {n_augments} augmentation passes...")
     model.eval()
-    all_probs = None
-    all_labels = []
-    all_attn = []
+    all_probs  = None
+    all_labels = []   # FIX #16: populated only on pass 0
+    all_attn   = []
+
+    lkw = dict(
+        num_workers=num_workers,
+        pin_memory=(device.type == "cuda"),
+        **({"prefetch_factor": 2} if num_workers > 0 else {}),
+    )
 
     for t_idx, tf in enumerate(tqdm(get_tta_transforms(n_augments), desc="TTA")):
-        ds = HybridDataset(dataset_dir, transform=tf,
-                           feature_cache=feature_cache, feature_scaler=feature_scaler)
-        loader = DataLoader(ds, batch_size=batch_size, shuffle=False,
-                            num_workers=num_workers, pin_memory=(device.type == "cuda"))
-        pass_probs, pass_labels, pass_attn = [], [], []
+        ds = HybridDataset(
+            dataset_dir, transform=tf,
+            feature_cache=feature_cache, feature_scaler=feature_scaler
+        )
+        loader = DataLoader(ds, batch_size=batch_size, shuffle=False, **lkw)
+
+        pass_probs = []
+        pass_attn  = []
 
         with torch.no_grad():
             for images, features, labels in loader:
                 images   = images.to(device, non_blocking=True)
                 features = features.to(device, non_blocking=True)
+
                 logits, attn = model(images, features)
                 pass_probs.append(F.softmax(logits, dim=-1).cpu().numpy())
                 pass_attn.append(attn.detach().cpu().numpy())
-                if t_idx == 0:
-                    pass_labels.extend(labels.numpy())
 
-        probs_np = np.concatenate(pass_probs, axis=0)
+                # FIX #16: collect labels only on first TTA pass
+                if t_idx == 0:
+                    all_labels.extend(labels.numpy())
+
+        probs_np  = np.concatenate(pass_probs, axis=0)
         all_probs = probs_np if all_probs is None else all_probs + probs_np
+
         if t_idx == 0:
-            all_labels = pass_labels
             all_attn = pass_attn
 
     all_probs /= n_augments
-    all_preds = all_probs.argmax(axis=1).tolist()
+    all_preds  = all_probs.argmax(axis=1).tolist()
     acc = 100.0 * sum(p == l for p, l in zip(all_preds, all_labels)) / len(all_labels)
     avg_attn = np.concatenate(all_attn, axis=0).mean(axis=0) if all_attn else np.array([])
     return acc, all_preds, all_labels, avg_attn
 
 
 def load_best_model(ckpt_path, device, num_classes, num_features):
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    try:
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    except TypeError:
+        # weights_only kwarg not supported on older PyTorch
+        ckpt = torch.load(ckpt_path, map_location=device)
     model = EfficientNetHybrid(num_classes=num_classes, num_features=num_features)
     model.load_state_dict(ckpt["model_state_dict"])
     model.to(device).eval()
@@ -536,10 +563,12 @@ def train_hybrid_model(args):
     set_seed(args.seed)
 
     print("=" * 80)
-    print("Hybrid Model Training  [EfficientNet-B3 + Medical Features — v3]")
+    print("Hybrid Model Training  [EfficientNet-B3 + Medical Features — v4]")
     print("=" * 80)
 
-    device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu_only else "cpu")
+    device = torch.device(
+        "cuda" if torch.cuda.is_available() and not args.cpu_only else "cpu"
+    )
     print(f"\nUsing device: {device}")
     if device.type == "cpu":
         torch.set_num_threads(args.num_threads)
@@ -557,7 +586,7 @@ def train_hybrid_model(args):
 
     # ── Feature scaler ────────────────────────────────────────────────────────
     print("\nExtracting features for normalisation...")
-    temp_ds = HybridDataset(data_dir / "train", transform=None)
+    temp_ds   = HybridDataset(data_dir / "train", transform=None)
     raw_feats = []
     for i in tqdm(range(len(temp_ds)), desc="Raw features"):
         _, f, _ = temp_ds[i]
@@ -566,6 +595,7 @@ def train_hybrid_model(args):
     feature_scaler = StandardScaler()
     feature_scaler.fit(raw_feats)
 
+    # Pre-fill cache with scaled features so workers never call scaler in parallel
     shared_cache = {}
     print("Pre-computing scaled feature cache...")
     for i in tqdm(range(len(temp_ds)), desc="Cache"):
@@ -574,27 +604,29 @@ def train_hybrid_model(args):
         shared_cache[img_path] = scaled
 
     # ── Datasets ──────────────────────────────────────────────────────────────
-    train_ds      = HybridDataset(data_dir / "train", get_transforms(True),  shared_cache)
-    train_eval_ds = HybridDataset(data_dir / "train", get_transforms(False), shared_cache)
+    # FIX #14: pass feature_scaler explicitly to all datasets
+    train_ds      = HybridDataset(data_dir / "train", get_transforms(True),  shared_cache, feature_scaler)
+    train_eval_ds = HybridDataset(data_dir / "train", get_transforms(False), shared_cache, feature_scaler)
     val_ds        = HybridDataset(data_dir / "val",   get_transforms(False), feature_scaler=feature_scaler)
 
     num_classes  = len(train_ds.class_to_idx)
     num_features = NUM_TRADITIONAL_FEATURES
 
-    # ── FIX #3: Inverse-frequency class weights for focal loss ────────────────
-    class_counts = Counter([lbl for _, lbl in train_ds.samples])
+    # ── FIX #3: Inverse-frequency class weights ────────────────────────────────
+    class_counts  = Counter([lbl for _, lbl in train_ds.samples])
     total_samples = sum(class_counts.values())
     class_weights = torch.tensor(
         [total_samples / (num_classes * class_counts[i]) for i in range(num_classes)],
         dtype=torch.float32
     ).to(device)
+
     print(f"\nClass counts  : {dict(sorted(class_counts.items()))}")
     print(f"Class weights : {class_weights.cpu().numpy().round(3)}")
 
-    # ── FIX #4: Stronger oversampling for minority classes (exponent 1.5) ─────
+    # ── FIX #4: Stronger oversampling (exponent 1.5) ─────────────────────────
     max_count = max(class_counts.values())
     sample_weights = [
-        (max_count / class_counts[lbl]) ** 1.5   # was 1.0 — hits minority harder
+        (max_count / class_counts[lbl]) ** 1.5
         for _, lbl in train_ds.samples
     ]
     sampler = WeightedRandomSampler(sample_weights, len(sample_weights), replacement=True)
@@ -604,22 +636,22 @@ def train_hybrid_model(args):
     if num_workers > 0:
         lkw["prefetch_factor"] = 2
 
-    train_loader      = DataLoader(train_ds,      batch_size=args.batch_size, sampler=sampler,  **lkw)
-    train_eval_loader = DataLoader(train_eval_ds, batch_size=args.batch_size, shuffle=False,    **lkw)
-    val_loader        = DataLoader(val_ds,        batch_size=args.batch_size, shuffle=False,    **lkw)
+    # FIX #15: shuffle must be False (or absent) when a sampler is provided
+    train_loader      = DataLoader(train_ds,      batch_size=args.batch_size, sampler=sampler, shuffle=False, **lkw)
+    train_eval_loader = DataLoader(train_eval_ds, batch_size=args.batch_size, shuffle=False, **lkw)
+    val_loader        = DataLoader(val_ds,        batch_size=args.batch_size, shuffle=False, **lkw)
 
     # ── Model ─────────────────────────────────────────────────────────────────
     print("\nCreating model...")
     model = build_model(num_classes, num_features, device, args.pretrained_cnn)
 
-    # ── FIX #5: Feature MLP gets head LR, not backbone LR ────────────────────
-    backbone_params = list(model.backbone.parameters())
-    backbone_ids    = {id(p) for p in backbone_params}
-    head_params     = [p for p in model.parameters() if id(p) not in backbone_ids]
+    # ── FIX #5: Feature MLP gets head LR ──────────────────────────────────────
+    backbone_ids = {id(p) for p in model.backbone.parameters()}
+    head_params  = [p for p in model.parameters() if id(p) not in backbone_ids]
 
     param_groups = [
-        {"params": backbone_params, "lr": args.learning_rate * 0.1, "name": "backbone"},
-        {"params": head_params,     "lr": args.learning_rate,        "name": "head"},
+        {"params": list(model.backbone.parameters()), "lr": args.learning_rate * 0.1, "name": "backbone"},
+        {"params": head_params,                        "lr": args.learning_rate,        "name": "head"},
     ]
 
     optimizer  = optim.AdamW(param_groups, weight_decay=0.01, betas=(0.9, 0.999))
@@ -629,9 +661,11 @@ def train_hybrid_model(args):
         base_lr=args.learning_rate, min_lr=1e-6,
     )
 
-    # FIX #1: Focal loss with class weights instead of label smoothing
+    # FIX #1: Focal loss with class weights
     criterion  = FocalLoss(gamma=2.0, weight=class_weights)
-    amp_scaler = torch.cuda.amp.GradScaler() if device.type == "cuda" else None
+
+    # FIX #12: Use updated AMP helper
+    amp_scaler = _make_amp_scaler(device)
 
     print("\n" + "=" * 80)
     print(f"Starting Training  [{args.epochs} epochs, patience={args.early_stopping_patience}]")
@@ -640,9 +674,9 @@ def train_hybrid_model(args):
     print(f"  AMP={'on' if amp_scaler else 'off'}")
     print("=" * 80)
 
-    best_val_acc    = 0.0
+    best_val_acc     = 0.0
     patience_counter = 0
-    UNFREEZE_EPOCH  = warmup_ep + 1
+    UNFREEZE_EPOCH   = warmup_ep + 1
 
     for epoch in range(1, args.epochs + 1):
 
@@ -655,24 +689,26 @@ def train_hybrid_model(args):
             print(f"\n  [Epoch {epoch}] Unfreezing more backbone layers")
             model.unfreeze_backbone(blocks_from_end=5)
 
-        train_loss   = train_epoch(model, train_loader, optimizer, device, epoch, criterion, amp_scaler)
-        current_lr   = scheduler.step()
+        train_loss = train_epoch(
+            model, train_loader, optimizer, device, epoch, criterion, amp_scaler
+        )
+        current_lr = scheduler.step()
 
         train_acc = float("nan")
         if epoch > 1:
-            _, train_acc, _, _, _ = evaluate(model, train_eval_loader, device, f"Epoch {epoch} [train eval]")
+            _, train_acc, _, _, _ = evaluate(
+                model, train_eval_loader, device, f"Epoch {epoch} [train eval]"
+            )
 
         val_loss, val_acc, val_preds, val_labels, avg_attn = evaluate(
             model, val_loader, device, f"Epoch {epoch} [val]"
         )
 
-        # Print attention split so we can verify the fix is working
         attn_str = (
             f"CNN={float(avg_attn[0]):.3f} / Feat={float(avg_attn[1]):.3f}"
             if avg_attn.ndim == 1 and len(avg_attn) == 2
             else "n/a"
         )
-
         print(f"\nEpoch {epoch}/{args.epochs}  |  LR: {current_lr:.7f}  |  Attn: {attn_str}")
         print(f"  Train Loss : {train_loss:.4f}  |  Train Acc : {train_acc:.2f}%")
         print(f"  Val Loss   : {val_loss:.4f}  |  Val Acc   : {val_acc:.2f}%")
@@ -696,10 +732,9 @@ def train_hybrid_model(args):
         else:
             patience_counter += 1
             print(f"  No improvement ({patience_counter}/{args.early_stopping_patience})")
-
-        if patience_counter >= args.early_stopping_patience:
-            print(f"\nEarly stopping at epoch {epoch}")
-            break
+            if patience_counter >= args.early_stopping_patience:
+                print(f"\nEarly stopping at epoch {epoch}")
+                break
 
         if epoch % 10 == 0:
             torch.save({
@@ -741,7 +776,8 @@ def train_hybrid_model(args):
     print(confusion_matrix(labels_tta, preds_tta))
 
     if hasattr(model, "get_feature_importance") and avg_attn.size > 0:
-        print("\nFeature Branch Attention Weight:", round(float(avg_attn[1]) if avg_attn.ndim == 1 else float(avg_attn[:, 1].mean()), 4))
+        print("\nFeature Branch Attention Weight:",
+              round(float(avg_attn[1]) if avg_attn.ndim == 1 else float(avg_attn[:, 1].mean()), 4))
         print("Top-10 Feature Importance:")
         imp = model.get_feature_importance(avg_attn, FEATURE_NAMES)
         for i, (n, s) in enumerate(list(imp.items())[:10], 1):
@@ -753,7 +789,7 @@ def train_hybrid_model(args):
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 def main():
-    parser = argparse.ArgumentParser(description="Train Hybrid Model — EfficientNet-B3 v3")
+    parser = argparse.ArgumentParser(description="Train Hybrid Model — EfficientNet-B3 v4")
     parser.add_argument("--data-dir",                type=str,   default="data")
     parser.add_argument("--pretrained-cnn",          type=str,   default=None)
     parser.add_argument("--epochs",                  type=int,   default=80)

@@ -15,6 +15,33 @@ const STAGE_DESCRIPTIONS = {
   'Cancer': 'Invasive cervical cancer detected. Requires urgent medical intervention.'
 };
 
+// Normalize the API response to a consistent shape regardless of key naming
+function normalizeResult(data) {
+  if (!data) return null;
+
+  // Support both snake_case and camelCase key variants from the backend
+  const predictedClass =
+    data.predicted_class ||
+    data.prediction ||
+    data.class ||
+    data.label ||
+    null;
+
+  const confidence =
+    data.confidence != null ? data.confidence :
+    data.confidence_score != null ? data.confidence_score :
+    data.score != null ? data.score :
+    null;
+
+  const probabilities =
+    data.probabilities ||
+    data.probs ||
+    data.class_probabilities ||
+    null;
+
+  return { predicted_class: predictedClass, confidence, probabilities };
+}
+
 function App() {
   const [selectedFile, setSelectedFile] = useState(null);
   const [preview, setPreview] = useState(null);
@@ -48,7 +75,7 @@ function App() {
   const handleDrop = (event) => {
     event.preventDefault();
     setDragging(false);
-    
+
     const file = event.dataTransfer.files[0];
     if (file && file.type.startsWith('image/')) {
       setSelectedFile(file);
@@ -79,9 +106,40 @@ function App() {
           'Content-Type': 'multipart/form-data',
         },
       });
-      setResult(response.data);
+
+      console.log('API raw response:', response.data);
+
+      const normalized = normalizeResult(response.data);
+      console.log('Normalized result:', normalized);
+
+      if (!normalized || !normalized.predicted_class) {
+        setError(
+          'Prediction received but could not read the result. ' +
+          'Check console for the raw API response and verify key names match ' +
+          '(expected: predicted_class, confidence, probabilities).'
+        );
+        return;
+      }
+
+      setResult(normalized);
     } catch (err) {
-      setError(err.response?.data?.detail || 'Error making prediction. Please ensure the backend is running.');
+      console.error('Prediction error:', err);
+
+      // Give a clear, specific error message
+      if (!err.response) {
+        // Network error — backend down or CORS
+        setError(
+          'Could not reach the server at ' + API_URL + '. ' +
+          'Make sure the backend is running and CORS is enabled. ' +
+          '(Check the browser console for details.)'
+        );
+      } else {
+        setError(
+          err.response?.data?.detail ||
+          err.response?.data?.message ||
+          `Server error ${err.response.status}: ${err.response.statusText}`
+        );
+      }
     } finally {
       setLoading(false);
     }
@@ -156,129 +214,155 @@ function App() {
       {/* Main Content */}
       <div className="main-wrapper">
         <div className="main-container">
-        <div className="upload-section">
-          <h2>Upload Cervical Image</h2>
-          
-          <div
-            className={`upload-area ${dragging ? 'dragging' : ''}`}
-            onClick={() => fileInputRef.current?.click()}
-            onDragOver={handleDragOver}
-            onDragLeave={handleDragLeave}
-            onDrop={handleDrop}
-          >
-            <div className="upload-icon">📁</div>
-            <div className="upload-text">
-              {selectedFile ? selectedFile.name : 'Click to upload or drag and drop'}
-            </div>
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept="image/*"
-              onChange={handleFileSelect}
-              className="file-input"
-            />
-          </div>
+          <div className="upload-section">
+            <h2>Upload Cervical Image</h2>
 
-          {preview && (
-            <div className="selected-image">
-              <img src={preview} alt="Preview" className="preview-image" />
-            </div>
-          )}
-
-          <div className="button-group">
-            <button
-              onClick={handlePredict}
-              disabled={!selectedFile || loading}
-              className="gov-button primary"
+            <div
+              className={`upload-area ${dragging ? 'dragging' : ''}`}
+              onClick={() => fileInputRef.current?.click()}
+              onDragOver={handleDragOver}
+              onDragLeave={handleDragLeave}
+              onDrop={handleDrop}
             >
-              {loading ? 'Analyzing Image...' : '🔍 Analyze & Predict Stage'}
-            </button>
-            {selectedFile && (
-              <button onClick={handleReset} className="gov-button secondary">
-                🔄 Clear & Reset
+              <div className="upload-icon">📁</div>
+              <div className="upload-text">
+                {selectedFile ? selectedFile.name : 'Click to upload or drag and drop'}
+              </div>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="image/*"
+                onChange={handleFileSelect}
+                className="file-input"
+              />
+            </div>
+
+            {preview && (
+              <div className="selected-image">
+                <img src={preview} alt="Preview" className="preview-image" />
+              </div>
+            )}
+
+            <div className="button-group">
+              <button
+                onClick={handlePredict}
+                disabled={!selectedFile || loading}
+                className="gov-button primary"
+              >
+                {loading ? 'Analyzing Image...' : '🔍 Analyze & Predict Stage'}
               </button>
+              {selectedFile && (
+                <button onClick={handleReset} className="gov-button secondary">
+                  🔄 Clear & Reset
+                </button>
+              )}
+            </div>
+
+            {/* Error display */}
+            {error && (
+              <div className="error-message" style={{
+                marginTop: '16px',
+                padding: '12px 16px',
+                background: '#fdecea',
+                border: '1px solid #f5c6c6',
+                borderRadius: '8px',
+                color: '#b71c1c',
+                fontSize: '14px',
+                lineHeight: '1.5'
+              }}>
+                ⚠️ {error}
+              </div>
             )}
           </div>
-        </div>
 
-        {/* Government Schemes Info */}
-        <div className="info-section">
-          <h3>Government Healthcare Schemes</h3>
-          <div className="schemes-grid">
-            <div className="scheme-card">
-              <h4>Ayushman Bharat</h4>
-              <p>Free cancer treatment coverage up to ₹5 lakhs per family per year</p>
-            </div>
-            <div className="scheme-card">
-              <h4>National Health Mission</h4>
-              <p>Free cervical cancer screening at all government health centers</p>
-            </div>
-            <div className="scheme-card">
-              <h4>HPV Vaccination</h4>
-              <p>Government-subsidized HPV vaccines available for eligible age groups</p>
+          {/* Government Schemes Info */}
+          <div className="info-section">
+            <h3>Government Healthcare Schemes</h3>
+            <div className="schemes-grid">
+              <div className="scheme-card">
+                <h4>Ayushman Bharat</h4>
+                <p>Free cancer treatment coverage up to ₹5 lakhs per family per year</p>
+              </div>
+              <div className="scheme-card">
+                <h4>National Health Mission</h4>
+                <p>Free cervical cancer screening at all government health centers</p>
+              </div>
+              <div className="scheme-card">
+                <h4>HPV Vaccination</h4>
+                <p>Government-subsidized HPV vaccines available for eligible age groups</p>
+              </div>
             </div>
           </div>
-        </div>
 
-        {/* Results Section */}
-        {result && (
-          <div className="results-section">
-            <div className="result-badge">Classification Result</div>
-            <h2 className="predicted-class">{result.predicted_class}</h2>
-            <div className="confidence-display">
-              <span className="confidence-label">Confidence Score:</span>
-              <span className="confidence-value">
-                {(result.confidence * 100).toFixed(2)}%
-              </span>
-            </div>
-            
-            <div className="stage-description">
-              <h4>Clinical Description</h4>
-              <p>{STAGE_DESCRIPTIONS[result.predicted_class]}</p>
-            </div>
+          {/* Results Section */}
+          {result && result.predicted_class && (
+            <div className="results-section">
+              <div className="result-badge">Classification Result</div>
+              <h2 className="predicted-class">{result.predicted_class}</h2>
 
-            <div className="action-recommendations">
-              <h4>Recommended Actions</h4>
-              <ul>
-                {result.predicted_class === 'Normal' ? (
-                  <>
-                    <li>Continue regular screening every 3 years</li>
-                    <li>Maintain healthy lifestyle</li>
-                    <li>Consider HPV vaccination if eligible</li>
-                  </>
-                ) : (
-                  <>
-                    <li>Consult gynecologic oncologist immediately</li>
-                    <li>Get confirmatory biopsy and colposcopy</li>
-                    <li>Explore treatment options (LEEP, cryotherapy, surgery)</li>
-                    <li>Check eligibility for Ayushman Bharat coverage</li>
-                  </>
-                )}
-              </ul>
-            </div>
-
-            <div className="probabilities">
-              <h3>Detailed Stage Probability Analysis</h3>
-              {Object.entries(result.probabilities).map(([stage, prob]) => (
-                <div key={stage} className="probability-bar">
-                  <div className="probability-label">
-                    <span className="stage-name">{stage}</span>
-                    <span className="prob-value">{(prob * 100).toFixed(2)}%</span>
-                  </div>
-                  <div className="bar-container">
-                    <div
-                      className="bar-fill"
-                      style={{ 
-                        width: `${prob * 100}%`,
-                        background: prob > 0.5 ? '#d32f2f' : prob > 0.3 ? '#f57c00' : '#1a5490'
-                      }}
-                    />
-                  </div>
+              {result.confidence != null && (
+                <div className="confidence-display">
+                  <span className="confidence-label">Confidence Score:</span>
+                  <span className="confidence-value">
+                    {(result.confidence * 100).toFixed(2)}%
+                  </span>
                 </div>
-              ))}
+              )}
+
+              <div className="stage-description">
+                <h4>Clinical Description</h4>
+                <p>
+                  {STAGE_DESCRIPTIONS[result.predicted_class] ||
+                    'No description available for this classification.'}
+                </p>
+              </div>
+
+              <div className="action-recommendations">
+                <h4>Recommended Actions</h4>
+                <ul>
+                  {result.predicted_class === 'Normal' ? (
+                    <>
+                      <li>Continue regular screening every 3 years</li>
+                      <li>Maintain healthy lifestyle</li>
+                      <li>Consider HPV vaccination if eligible</li>
+                    </>
+                  ) : (
+                    <>
+                      <li>Consult gynecologic oncologist immediately</li>
+                      <li>Get confirmatory biopsy and colposcopy</li>
+                      <li>Explore treatment options (LEEP, cryotherapy, surgery)</li>
+                      <li>Check eligibility for Ayushman Bharat coverage</li>
+                    </>
+                  )}
+                </ul>
+              </div>
+
+              {result.probabilities && Object.keys(result.probabilities).length > 0 && (
+                <div className="probabilities">
+                  <h3>Detailed Stage Probability Analysis</h3>
+                  {Object.entries(result.probabilities).map(([stage, prob]) => (
+                    <div key={stage} className="probability-bar">
+                      <div className="probability-label">
+                        <span className="stage-name">{stage}</span>
+                        <span className="prob-value">{(prob * 100).toFixed(2)}%</span>
+                      </div>
+                      <div className="bar-container">
+                        <div
+                          className="bar-fill"
+                          style={{
+                            width: `${prob * 100}%`,
+                            background:
+                              prob > 0.5 ? '#d32f2f' :
+                              prob > 0.3 ? '#f57c00' : '#1a5490'
+                          }}
+                        />
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
-          </div>
-        )}
+          )}
         </div>
       </div>
 
