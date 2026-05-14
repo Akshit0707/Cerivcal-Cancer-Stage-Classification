@@ -19,30 +19,21 @@ def load_model(model_path, device="cpu"):
 
     from train_hybrid import EfficientNetHybrid
 
-    # Read exact attention dims from checkpoint
-    fusion_dim  = sd["attention.0.weight"].shape[1]
-    attn_hidden = sd["attention.0.weight"].shape[0]
-    print(f"[load_model] checkpoint attention: fusion_dim={fusion_dim} hidden={attn_hidden}")
-
-    # Build model
     model = EfficientNetHybrid(num_classes=5, num_features=30)
 
-    # Overwrite attention to match checkpoint EXACTLY
+    # Patch attention to EXACTLY match checkpoint:
+    # index 0 = Linear(1664,64)
+    # index 1 = ReLU        (no params)
+    # index 2 = Linear(64,2)
+    # index 3 = Softmax      (no params)
     model.attention = nn.Sequential(
-        nn.Linear(fusion_dim, attn_hidden),
+        nn.Linear(1664, 64),
         nn.ReLU(inplace=True),
-        nn.Linear(attn_hidden, 2),
+        nn.Linear(64, 2),
         nn.Softmax(dim=-1),
     )
 
-    # Verify shapes match before loading
-    print(f"[load_model] model attention.0 shape: {model.attention[0].weight.shape}")
-    print(f"[load_model] checkpoint attention.0 shape: {sd['attention.0.weight'].shape}")
-
-    result = model.load_state_dict(sd, strict=False)
-    print(f"[load_model] missing : {result.missing_keys}")
-    print(f"[load_model] unexpected: {result.unexpected_keys}")
-
+    model.load_state_dict(sd, strict=True)
     model.to(device)
     model.eval()
     print("[load_model] SUCCESS")
