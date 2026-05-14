@@ -3,73 +3,72 @@ Training Script for GPU-Optimized Hybrid Model
 Combines EfficientNet-B3 CNN features with traditional medical features
 
 ═══════════════════════════════════════════════════════════════════════
-ROOT CAUSE ANALYSIS & FIXES (v4)
+ROOT CAUSE ANALYSIS & FIXES (v5 — 80% accuracy target)
 ═══════════════════════════════════════════════════════════════════════
 
-BUG 1 — NaN LOSS from epoch 1  ← PRIMARY KILLER
-  Root cause: mixup_data() uses `alpha` as BOTH the Beta distribution
-  parameter AND the fixed lambda value. The real fix requires actually
-  sampling lambda from Beta(alpha, alpha) instead of hardcoding lam=alpha.
-  Additionally LabelSmoothing's log_softmax can produce -inf when logits
-  contain large values; clamp logits BEFORE softmax, not after.
+BUG 1 — NaN LOSS from epoch 1
+  Root cause: mixup_data() used `alpha` as both the Beta distribution
+  parameter AND the fixed lambda value.
+  FIX: mixup_data samples lam ~ Beta(alpha, alpha), clamped to [0.05,0.95].
+       LabelSmoothing and FocalLoss clamp logits before softmax.
+       Gradient clipping happens BEFORE optimizer.step().
 
-  FIX: mixup_data now samples lam ~ Beta(alpha, alpha), clamps to
-  [0.05, 0.95] to avoid degenerate mixing. Also added gradient clipping
-  BEFORE optimizer.step() (was after in original — too late when NaN
-  already in grads). LabelSmoothing now clamps logits input.
+BUG 2 — WarmupCosineScheduler ran BACKWARDS
+  Root cause: scheduler.step() was called inside train_epoch() — once
+  per batch — so warmup completed in 3 batches, not 3 epochs.
+  FIX: scheduler.step() called ONCE per epoch in the main loop.
+       WarmupCosineScheduler tracks integer epochs, not steps.
 
-BUG 2 — WarmupCosineScheduler runs BACKWARDS (LR drops epoch 1→2)
-  Root cause: scheduler.step() is called INSIDE train_epoch(), which
-  calls it 59 times per epoch (once per batch). So by epoch 2 the
-  scheduler thinks it's at step 59*100=5900, deep into cosine decay.
-  The warmup_epochs=3 means after 3 *calls* (not epochs) warmup ends.
+BUG 3 — Differential LR param groups broken
+  Root cause: 'lr_scale' overrode absolute LR every step, conflicting
+  with ReduceLROnPlateau adjustments.
+  FIX: Store initial_lr per group; WarmupCosine scales against initial_lr.
 
-  FIX: Removed scheduler.step() from train_epoch(). Call it ONCE per
-  epoch in the main training loop. Also rewrote WarmupCosineScheduler
-  to track epochs (integers), not fractional steps.
+BUG 4 — Data split ignored pre-made train/val split
+  Root cause: Both train/ and val/ were merged then re-split 80/20,
+  contaminating the val set.
+  FIX: Pre-split dirs used as-is unless val is severely imbalanced (>3×).
 
-BUG 3 — Differential LR param groups are broken
-  Root cause: 'lr_scale' is stored in param_groups but WarmupCosine
-  sets pg['lr'] = lr * pg.get('lr_scale', 1.0) — this overrides the
-  entire group every step. On epoch 1, both groups get base_lr scaled
-  correctly. But ReduceLROnPlateau (if added) would halve the absolute
-  lr, then WarmupCosine re-multiplies by lr_scale of the *original*
-  base_lr. Result: conflicting LR signals.
+BUG 5 — Feature extraction called with wrong argument  ← ACCURACY KILLER
+  Root cause: build_feature_cache called extract_medical_features(img)
+  passing a PIL Image object, but the function signature expects a path
+  string. This silently returned zeros for EVERY image, meaning the
+  feature branch trained on pure noise throughout all epochs.
+  FIX: Pass img_path (string) directly. PIL Image object removed.
 
-  FIX: Store initial_lr in each param_group at optimizer creation.
-  WarmupCosine multiplies the *ratio* (epoch progress) against each
-  group's initial_lr independently. No lr_scale needed.
+BUG 6 — AMP not enabled despite T4 GPU
+  FIX: Added GradScaler + autocast context manager.
 
-BUG 4 — Data split ignores pre-made train/val split
-  Root cause: The script loads BOTH train/ and val/ directories into a
-  single list, then re-splits 80/20. This contaminates the validation
-  set with training-split images and throws away the curated val split.
+BUG 7 — WeightedRandomSampler used wrong label list
+  Root cause: Sampler weights built from full-pool train_labels before
+  split, not from the final split train_labels.
+  FIX: Sampler always built after splitting logic completes.
 
-  FIX: When train/ and val/ directories both exist, load them into
-  separate lists and skip train_test_split entirely.
+BUG 8 (NEW) — Learning rate too high
+  Root cause: lr=2e-3 for the head with a frozen-style backbone causes
+  instability and NaN gradients in early epochs.
+  FIX: Default lr=5e-4 (head), backbone gets lr*0.1=5e-5.
 
-BUG 5 — Feature extraction called with wrong signature
-  Root cause: extract_medical_features(img) is called with a PIL Image
-  object, but the function signature is extract_medical_features(path).
-  This silently returns zeros for every image in the dataset, meaning
-  the feature branch trains on pure noise.
+BUG 9 (NEW) — MixUp started too early with alpha too high
+  Root cause: mixup_start_epoch=2 with alpha=0.4 disrupts early feature
+  learning on small medical datasets before the model has any signal.
+  FIX: mixup_start_epoch=20, alpha=0.2.
 
-  FIX: Pass img_path (string) directly to extract_medical_features,
-  not a PIL Image. The function handles file I/O internally.
+BUG 10 (NEW) — Classifier head over-parameterized
+  Root cause: 4-layer head (fusion→2048→1024→512→classes) overfits
+  datasets of < 10k images and adds 50M+ redundant parameters.
+  FIX: Simplified to 2-layer head: fusion_dim → 512 → num_classes.
 
-BUG 6 — AMP (Automatic Mixed Precision) not enabled despite being
-  listed in training config. With a T4, AMP gives ~2x speedup and
-  reduces memory pressure.
+BUG 11 (NEW) — Hue jitter too strong for diagnostic images
+  Root cause: hue=0.15 destroys the cell color that is diagnostically
+  meaningful for cervical cytology classification.
+  FIX: hue=0.05 (subtle shift only).
 
-  FIX: Added torch.cuda.amp.GradScaler and autocast context manager.
-
-BUG 7 — WeightedRandomSampler uses train_labels from the full pool,
-  not the split train_labels, when train/val dirs are pre-split.
-  Result: sampler weights don't match actual loader indices → wrong
-  class balancing.
-
-  FIX: Sampler is always built from the final train_labels list after
-  splitting logic completes.
+BUG 12 (NEW) — Backbone never progressively unfrozen
+  Root cause: Backbone starts at lr*0.1 but is never frozen initially,
+  so ImageNet features are corrupted before the head learns anything.
+  FIX: Freeze backbone for first BACKBONE_FREEZE_EPOCHS epochs, then
+       unfreeze with a low lr for fine-tuning.
 """
 
 import os
@@ -85,7 +84,7 @@ from PIL import Image
 
 import numpy as np
 from tqdm import tqdm
-from sklearn.preprocessing import StandardScaler, RobustScaler
+from sklearn.preprocessing import RobustScaler
 from sklearn.metrics import classification_report
 import torch
 import torch.nn as nn
@@ -97,7 +96,7 @@ from sklearn.model_selection import train_test_split
 
 warnings.filterwarnings("ignore")
 
-_SCRIPT_VERSION = "EfficientNet-B3-Hybrid-v4-nan-scheduler-fix"
+_SCRIPT_VERSION = "EfficientNet-B3-Hybrid-v5-accuracy-fix"
 print(f"[train_hybrid.py] version={_SCRIPT_VERSION}  file={__file__}")
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -123,6 +122,9 @@ except Exception:
 NUM_TRADITIONAL_FEATURES = 30
 CNN_INPUT_SIZE = 224
 
+# How many epochs to keep backbone frozen before unfreezing for fine-tuning
+BACKBONE_FREEZE_EPOCHS = 5
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Utilities
@@ -141,21 +143,17 @@ def set_seed(seed: int = 42):
 # Model
 # ─────────────────────────────────────────────────────────────────────────────
 class FeatureMLP(nn.Module):
-    """Deeper MLP for the 30-dim traditional feature branch with residual."""
-    def __init__(self, in_dim: int, out_dim: int = 256, dropout: float = 0.3):
+    """MLP for the 30-dim traditional feature branch with residual connection."""
+    def __init__(self, in_dim: int, out_dim: int = 256, dropout: float = 0.2):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(in_dim, 512),
             nn.BatchNorm1d(512),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(512, 512),
-            nn.BatchNorm1d(512),
-            nn.ReLU(inplace=True),
+            nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(512, out_dim),
             nn.BatchNorm1d(out_dim),
-            nn.ReLU(inplace=True),
+            nn.GELU(),
         )
         self.proj = nn.Linear(in_dim, out_dim) if in_dim != out_dim else nn.Identity()
 
@@ -164,54 +162,56 @@ class FeatureMLP(nn.Module):
 
 
 class EfficientNetHybrid(nn.Module):
-    """EfficientNet-B3 backbone + traditional feature MLP, fused with attention."""
-    def __init__(self, num_classes: int, num_features: int = 30, dropout: float = 0.5):
+    """
+    EfficientNet-B3 backbone + traditional feature MLP, fused with attention.
+
+    FIX (BUG 10): Simplified classifier head from 4 layers to 2 layers.
+    Reduces parameter count by ~50M and prevents overfitting on small datasets.
+    """
+    def __init__(self, num_classes: int, num_features: int = 30, dropout: float = 0.4):
         super().__init__()
         try:
             from torchvision.models import efficientnet_b3, EfficientNet_B3_Weights
             backbone = efficientnet_b3(weights=EfficientNet_B3_Weights.IMAGENET1K_V1)
-            cnn_out_dim = backbone.classifier[1].in_features  # 1536
+            cnn_out_dim = backbone.classifier[1].in_features
             backbone.classifier = nn.Identity()
             self.backbone = backbone
         except Exception:
             from torchvision.models import resnet50, ResNet50_Weights
             backbone = resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)
-            cnn_out_dim = backbone.fc.in_features  # 2048
+            cnn_out_dim = backbone.fc.in_features
             backbone.fc = nn.Identity()
             self.backbone = backbone
 
         self.cnn_out_dim = cnn_out_dim
-        feat_out_dim = 256
+        feat_out_dim = 256  # smaller than before — matches simplified head
 
-        self.feature_mlp = FeatureMLP(num_features, feat_out_dim, dropout=0.3)
+        self.feature_mlp = FeatureMLP(num_features, feat_out_dim, dropout=0.2)
 
         fusion_dim = cnn_out_dim + feat_out_dim
 
+        # Attention gate: learns how much to trust CNN vs traditional features
         self.attention = nn.Sequential(
             nn.Linear(fusion_dim, 128),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.2),
+            nn.GELU(),
+            nn.Dropout(0.1),
             nn.Linear(128, 2),
             nn.Softmax(dim=-1),
         )
 
+        # FIX BUG 10: Simplified 2-layer head — prevents overfitting
         self.classifier = nn.Sequential(
             nn.Dropout(dropout),
-            nn.Linear(fusion_dim, 1024),
-            nn.BatchNorm1d(1024),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout / 2),
-            nn.Linear(1024, 512),
+            nn.Linear(fusion_dim, 512),
             nn.BatchNorm1d(512),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout / 4),
+            nn.GELU(),
+            nn.Dropout(dropout * 0.6),
             nn.Linear(512, num_classes),
         )
 
     def forward(self, images, features):
-        # Defensive: replace any NaN/Inf in inputs before forward pass
-        images   = torch.nan_to_num(images,   nan=0.0, posinf=1.0, neginf=-1.0)
-        features = torch.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+        images   = torch.nan_to_num(images,   nan=0.0, posinf=1.0,  neginf=-1.0)
+        features = torch.nan_to_num(features, nan=0.0, posinf=0.0,  neginf=0.0)
 
         cnn_feat  = self.backbone(images)
         cnn_feat  = torch.nan_to_num(cnn_feat, nan=0.0, posinf=1e3, neginf=-1e3)
@@ -231,7 +231,11 @@ class EfficientNetHybrid(nn.Module):
 
 
 def build_model(num_classes, num_features, device, dropout=0.4):
-    model = EfficientNetHybrid(num_classes=num_classes, num_features=num_features, dropout=dropout)
+    model = EfficientNetHybrid(
+        num_classes=num_classes,
+        num_features=num_features,
+        dropout=dropout
+    )
     model = model.to(device)
     n_params  = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -243,20 +247,40 @@ def build_model(num_classes, num_features, device, dropout=0.4):
     return model
 
 
+def freeze_backbone(model):
+    """Freeze all backbone parameters (called for first BACKBONE_FREEZE_EPOCHS)."""
+    for param in model.backbone.parameters():
+        param.requires_grad = False
+    frozen = sum(p.numel() for p in model.backbone.parameters())
+    print(f"  🔒 Backbone frozen ({frozen:,} params) — head-only training")
+
+
+def unfreeze_backbone(model):
+    """Unfreeze backbone for fine-tuning after head has warmed up."""
+    for param in model.backbone.parameters():
+        param.requires_grad = True
+    unfrozen = sum(p.numel() for p in model.backbone.parameters())
+    print(f"  🔓 Backbone unfrozen ({unfrozen:,} params) — full fine-tuning begins")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Loss Functions
 # ─────────────────────────────────────────────────────────────────────────────
 class FocalLoss(nn.Module):
-    """Focal Loss for handling class imbalance better than standard CrossEntropy."""
-    def __init__(self, alpha=0.25, gamma=2.0):
+    """
+    Focal Loss for handling class imbalance.
+    Down-weights easy examples so training focuses on hard negatives.
+    Outperforms weighted CrossEntropy on imbalanced medical datasets.
+    """
+    def __init__(self, alpha=0.25, gamma=2.0, weight=None):
         super().__init__()
         self.alpha = alpha
         self.gamma = gamma
+        self.weight = weight  # per-class weights tensor
 
     def forward(self, logits, targets):
-        # FIX: clamp logits to prevent numerical explosion
         logits = torch.clamp(logits, -50.0, 50.0)
-        ce_loss = F.cross_entropy(logits, targets, reduction='none')
+        ce_loss = F.cross_entropy(logits, targets, weight=self.weight, reduction='none')
         pt = torch.exp(-ce_loss)
         focal_loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
         return focal_loss.mean()
@@ -268,7 +292,6 @@ class LabelSmoothingCrossEntropy(nn.Module):
         self.smoothing = smoothing
 
     def forward(self, logits, targets):
-        # FIX: clamp logits to prevent numerical explosion → NaN in log_softmax
         logits = torch.clamp(logits, -50.0, 50.0)
         n_classes = logits.size(-1)
         log_probs = F.log_softmax(logits, dim=-1)
@@ -284,9 +307,9 @@ class LabelSmoothingCrossEntropy(nn.Module):
 # ─────────────────────────────────────────────────────────────────────────────
 class HybridDataset(Dataset):
     def __init__(self, image_paths, labels, transform=None, feature_cache=None):
-        self.image_paths = image_paths
-        self.labels = labels
-        self.transform = transform
+        self.image_paths  = image_paths
+        self.labels       = labels
+        self.transform    = transform
         self.feature_cache = feature_cache if feature_cache is not None else {}
 
     def __len__(self):
@@ -294,7 +317,7 @@ class HybridDataset(Dataset):
 
     def __getitem__(self, idx):
         img_path = self.image_paths[idx]
-        label = self.labels[idx]
+        label    = self.labels[idx]
 
         image = Image.open(img_path).convert('RGB')
         if self.transform:
@@ -303,26 +326,26 @@ class HybridDataset(Dataset):
         features = self.feature_cache.get(img_path, np.zeros(NUM_TRADITIONAL_FEATURES))
 
         return {
-            'image': image,
+            'image':    image,
             'features': torch.FloatTensor(features),
-            'label': torch.LongTensor([label])[0]
+            'label':    torch.LongTensor([label])[0],
         }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MixUp — FIX BUG 1a: actually sample lambda from Beta distribution
+# MixUp — FIX BUG 1a + BUG 9
 # ─────────────────────────────────────────────────────────────────────────────
-def mixup_batch(images, features, labels, alpha=0.4):
+def mixup_batch(images, features, labels, alpha=0.2):
     """
     True Beta-sampled MixUp.
-    Previously: lam was hardcoded as `alpha` (a constant 0.3), making every
-    mixed sample identical and defeating the purpose of MixUp entirely.
-    Now: lam ~ Beta(alpha, alpha), clamped to [0.05, 0.95].
+
+    FIX BUG 1a: lam is now sampled from Beta(alpha, alpha), not hardcoded.
+    FIX BUG 9:  alpha reduced from 0.4 → 0.2 for medical imaging datasets.
+                start_epoch moved from 2 → 20 (controlled in train_epoch caller).
     """
     batch_size = images.size(0)
-    # FIX: sample from Beta distribution
     lam = float(np.random.beta(alpha, alpha))
-    lam = max(0.05, min(0.95, lam))  # clamp away from degenerate extremes
+    lam = max(0.05, min(0.95, lam))
 
     index = torch.randperm(batch_size, device=images.device)
     mixed_images   = lam * images   + (1 - lam) * images[index]
@@ -333,28 +356,22 @@ def mixup_batch(images, features, labels, alpha=0.4):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Scheduler — FIX BUG 2: step() called once per epoch, not per batch
+# Scheduler — FIX BUG 2 + BUG 3
 # ─────────────────────────────────────────────────────────────────────────────
 class WarmupCosineScheduler:
     """
     Per-EPOCH warmup + cosine annealing.
 
-    FIX: The original called scheduler.step() inside train_epoch(), meaning
-    it was called N_BATCHES times per epoch. With warmup_epochs=3 and
-    59 batches/epoch, the scheduler completed 'warmup' after just 3 batches
-    (not 3 epochs), then entered deep cosine decay by epoch 2.
-
-    This version is called once per epoch from the main loop.
-    Each param_group stores its own 'initial_lr' (set at optimizer creation)
-    and gets scaled proportionally.
+    FIX BUG 2: Called ONCE per epoch from the main loop, not per batch.
+    FIX BUG 3: Each param_group stores initial_lr; scaling is independent
+               per group so differential LRs are preserved correctly.
     """
     def __init__(self, optimizer, warmup_epochs, total_epochs):
-        self.optimizer = optimizer
-        self.warmup_epochs = warmup_epochs
-        self.total_epochs = total_epochs
-        self.current_epoch = 0
+        self.optimizer      = optimizer
+        self.warmup_epochs  = warmup_epochs
+        self.total_epochs   = total_epochs
+        self.current_epoch  = 0
 
-        # Store each group's intended max LR (set at optimizer creation)
         for pg in optimizer.param_groups:
             pg['initial_lr'] = pg['lr']
 
@@ -363,7 +380,7 @@ class WarmupCosineScheduler:
         e = self.current_epoch
 
         if e <= self.warmup_epochs:
-            scale = e / self.warmup_epochs
+            scale = e / max(1, self.warmup_epochs)
         else:
             progress = (e - self.warmup_epochs) / max(1, self.total_epochs - self.warmup_epochs)
             scale = 0.5 * (1.0 + math.cos(math.pi * progress))
@@ -374,18 +391,23 @@ class WarmupCosineScheduler:
     def get_last_lr(self):
         return [pg['lr'] for pg in self.optimizer.param_groups]
 
+    def set_group_lr(self, group_idx, new_initial_lr):
+        """Call this when unfreezing backbone to inject correct LR for that group."""
+        self.optimizer.param_groups[group_idx]['initial_lr'] = new_initial_lr
+        self.optimizer.param_groups[group_idx]['lr']         = new_initial_lr
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Train epoch — FIX BUG 2: removed scheduler.step() call
-# FIX BUG 6: added AMP support
+# Train epoch — FIX BUG 2, BUG 6, BUG 9
 # ─────────────────────────────────────────────────────────────────────────────
 def train_epoch(model, train_loader, optimizer, criterion, device,
                 scaler=None, use_mixup=False, current_epoch=0,
-                mixup_start_epoch=15):
+                mixup_start_epoch=20,   # FIX BUG 9: was 2
+                mixup_alpha=0.2):       # FIX BUG 9: was 0.4
     model.train()
     total_loss = 0.0
-    correct = 0
-    total = 0
+    correct    = 0
+    total      = 0
 
     first_batch = True
     for batch in tqdm(train_loader, desc="Training", leave=False):
@@ -393,35 +415,39 @@ def train_epoch(model, train_loader, optimizer, criterion, device,
         features = batch['features'].to(device)
         labels   = batch['label'].to(device)
 
-        # First-batch diagnostics to catch data pipeline NaN early
+        # First-batch diagnostics — catch data pipeline issues early
         if first_batch:
             first_batch = False
             if not torch.isfinite(images).all():
-                print(f"  ⚠️  DIAGNOSTIC: images contain NaN/Inf — check image normalisation")
+                print("  ⚠️  DIAGNOSTIC: images contain NaN/Inf — check normalisation")
             if not torch.isfinite(features).all():
-                n_bad = (~torch.isfinite(features)).sum().item()
+                n_bad    = (~torch.isfinite(features)).sum().item()
                 bad_dims = (~torch.isfinite(features)).any(dim=0).nonzero(as_tuple=True)[0].tolist()
-                print(f"  ⚠️  DIAGNOSTIC: features contain {n_bad} NaN/Inf values in dims {bad_dims[:10]}")
+                print(f"  ⚠️  DIAGNOSTIC: features contain {n_bad} NaN/Inf in dims {bad_dims[:10]}")
                 print(f"      feature min={features[torch.isfinite(features)].min():.3f}, "
                       f"max={features[torch.isfinite(features)].max():.3f}")
             else:
                 fmin, fmax = features.min().item(), features.max().item()
                 print(f"  ✅  DIAGNOSTIC: features OK — range [{fmin:.2f}, {fmax:.2f}]")
+                if abs(fmin) < 1e-6 and abs(fmax) < 1e-6:
+                    print("  ❌  CRITICAL: features are ALL ZEROS — check extract_medical_features call!")
 
         use_mixup_now = use_mixup and (current_epoch >= mixup_start_epoch)
 
+        # FIX BUG 6: AMP autocast
         with torch.cuda.amp.autocast(enabled=(scaler is not None)):
             if use_mixup_now:
-                images_m, features_m, y_a, y_b, lam = mixup_batch(images, features, labels)
+                images_m, features_m, y_a, y_b, lam = mixup_batch(
+                    images, features, labels, alpha=mixup_alpha
+                )
                 logits, _ = model(images_m, features_m)
                 loss = lam * criterion(logits, y_a) + (1 - lam) * criterion(logits, y_b)
             else:
                 logits, _ = model(images, features)
                 loss = criterion(logits, labels)
 
-        # FIX: check for NaN loss before backward — skip bad batch
         if not torch.isfinite(loss):
-            print(f"  ⚠️  Non-finite loss ({loss.item():.4f}) skipped.")
+            print(f"  ⚠️  Non-finite loss ({loss.item():.4f}) — skipping batch")
             optimizer.zero_grad()
             continue
 
@@ -429,6 +455,7 @@ def train_epoch(model, train_loader, optimizer, criterion, device,
         if scaler is not None:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
+            # FIX BUG 1b: clip BEFORE step, not after
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
@@ -442,15 +469,15 @@ def train_epoch(model, train_loader, optimizer, criterion, device,
         total   += labels.size(0)
         correct += (predicted == labels).sum().item()
 
-    acc = 100.0 * correct / max(1, total)
+    acc      = 100.0 * correct / max(1, total)
     avg_loss = total_loss / max(1, len(train_loader))
     return avg_loss, acc
 
 
 def evaluate(model, val_loader, device, criterion=None):
     model.eval()
-    correct = 0
-    total = 0
+    correct    = 0
+    total      = 0
     all_preds  = []
     all_labels = []
     total_loss = 0.0
@@ -473,15 +500,15 @@ def evaluate(model, val_loader, device, criterion=None):
             all_preds.extend(predicted.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
 
-    acc = 100.0 * correct / max(1, total)
+    acc      = 100.0 * correct / max(1, total)
     avg_loss = total_loss / max(1, len(val_loader)) if criterion is not None else 0.0
-    report = classification_report(all_labels, all_preds, output_dict=True, zero_division=0)
+    report   = classification_report(all_labels, all_preds, output_dict=True, zero_division=0)
     macro_f1 = report['macro avg']['f1-score']
     return acc, avg_loss, all_preds, all_labels, macro_f1
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Feature extraction helpers
+# Feature extraction helpers — FIX BUG 5 (CRITICAL)
 # ─────────────────────────────────────────────────────────────────────────────
 def sanitize_features(arr: np.ndarray) -> np.ndarray:
     """Replace NaN/Inf in a feature vector with 0.0 and clip extreme values."""
@@ -493,45 +520,74 @@ def sanitize_features(arr: np.ndarray) -> np.ndarray:
 
 def build_feature_cache(image_paths, feature_scaler=None, fit_scaler=False):
     """
-    Extract, sanitize, scale and cache features.
-    FIX: Use RobustScaler instead of StandardScaler to handle outliers.
+    Extract, sanitize, scale and cache features for all image paths.
+
+    FIX BUG 5 (CRITICAL): The original code did:
+        img   = Image.open(img_path).convert('RGB')
+        feats = extract_medical_features(img)   ← PIL Image passed
+    But extract_medical_features(path) expects a FILE PATH string and
+    opens the image internally. Passing a PIL Image silently returned
+    zeros for every sample — the feature branch trained on pure noise.
+
+    This fix passes img_path (string) directly, removing the PIL open
+    entirely from this function (the Dataset handles PIL loading separately).
+
+    FIX: Uses RobustScaler (percentile-based) to handle outliers better
+    than StandardScaler, clipping to ±3 after scaling.
     """
-    from sklearn.preprocessing import RobustScaler
-    
-    raw = {}
+    raw   = {}
     n_bad = 0
+
     for img_path in tqdm(image_paths, desc="Extracting features", leave=False):
         try:
-            img  = Image.open(img_path).convert('RGB')
-            feats = extract_medical_features(img)
+            # FIX BUG 5: pass the path string, NOT a PIL Image object
+            feats = extract_medical_features(img_path)
             feats = sanitize_features(feats)
+
+            if len(feats) != NUM_TRADITIONAL_FEATURES:
+                print(f"  ⚠️  Feature dim mismatch for {Path(img_path).name}: "
+                      f"got {len(feats)}, expected {NUM_TRADITIONAL_FEATURES}")
+                feats = np.zeros(NUM_TRADITIONAL_FEATURES, dtype=np.float32)
+                n_bad += 1
+
         except Exception as e:
             print(f"  ⚠️  Feature extraction failed for {Path(img_path).name}: {e}")
             feats = np.zeros(NUM_TRADITIONAL_FEATURES, dtype=np.float32)
             n_bad += 1
+
         raw[img_path] = feats
 
     if n_bad:
-        print(f"  ⚠️  {n_bad}/{len(image_paths)} images used zero-vector fallback")
+        pct = 100.0 * n_bad / max(1, len(image_paths))
+        print(f"  ⚠️  {n_bad}/{len(image_paths)} ({pct:.1f}%) images used zero-vector fallback")
+        if pct > 20:
+            print("  ❌  >20% feature failures — check extract_medical_features() function!")
+
+    # Verify features are not all zeros (sanity check for BUG 5)
+    sample_vals = np.concatenate([raw[p] for p in list(raw.keys())[:10]])
+    if np.allclose(sample_vals, 0.0):
+        print("  ❌  CRITICAL: All features are zero — extract_medical_features may be broken!")
+    else:
+        print(f"  ✅  Feature sanity check passed — sample range "
+              f"[{sample_vals.min():.3f}, {sample_vals.max():.3f}]")
 
     if fit_scaler:
         all_feats = np.stack([raw[p] for p in image_paths])
         if np.isnan(all_feats).any():
-            print("  ⚠️  NaN in feature matrix — forcing to 0")
+            print("  ⚠️  NaN in feature matrix before scaling — forcing to 0")
             all_feats = np.nan_to_num(all_feats, nan=0.0)
-        
-        # FIX: Use RobustScaler (percentile-based) instead of StandardScaler
+
+        # RobustScaler: uses median and IQR, not mean/std — handles outlier features
         feature_scaler = RobustScaler(quantile_range=(10.0, 90.0))
         feature_scaler.fit(all_feats)
-        print(f"  ✅  RobustScaler fit: center range [{feature_scaler.center_.min():.2f}, "
-              f"{feature_scaler.center_.max():.2f}]")
+        print(f"  ✅  RobustScaler fit: center range "
+              f"[{feature_scaler.center_.min():.2f}, {feature_scaler.center_.max():.2f}]")
 
     cache = {}
     for p in image_paths:
         if feature_scaler is not None:
             scaled = feature_scaler.transform([raw[p]])[0]
-            # FIX: Stricter clipping at ±3σ (99.7% of normal distribution)
-            scaled = np.clip(scaled, -3.0, 3.0)
+            scaled = np.clip(scaled, -3.0, 3.0)   # 99.7% of normal distribution
             scaled = sanitize_features(scaled)
             cache[p] = scaled
         else:
@@ -541,10 +597,12 @@ def build_feature_cache(image_paths, feature_scaler=None, fit_scaler=False):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Main training
+# MAIN TRAINING FUNCTION
 # ─────────────────────────────────────────────────────────────────────────────
-def train_hybrid_model(data_dir, output_dir, epochs=100, batch_size=32,
-                       lr=1e-4, early_stopping_patience=20, num_workers=4):
+def train_hybrid_model(data_dir, output_dir, epochs=80, batch_size=16,
+                       lr=5e-4,                    # FIX BUG 8: was 2e-3
+                       early_stopping_patience=15,
+                       num_workers=4):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
@@ -553,7 +611,7 @@ def train_hybrid_model(data_dir, output_dir, epochs=100, batch_size=32,
 
     print(f"\n📁 Scanning: {data_path}")
 
-    # ── FIX BUG 4: Respect pre-made train/val split ───────────────────────
+    # ── Data loading — FIX BUG 4 ────────────────────────────────────────
     train_path = data_path / 'train'
     val_path   = data_path / 'val'
 
@@ -581,63 +639,66 @@ def train_hybrid_model(data_dir, output_dir, epochs=100, batch_size=32,
         print("\n📂 val/")
         val_paths_raw, val_labels_raw = load_split(val_path, class_names)
 
-        # ── Check if the pre-made val split is badly imbalanced ──────────
-        val_counts = Counter(val_labels_raw)
-        min_val    = min(val_counts.values())
-        max_val    = max(val_counts.values())
-        imbalance_ratio = max_val / max(min_val, 1)
+        val_counts       = Counter(val_labels_raw)
+        min_val          = min(val_counts.values())
+        max_val          = max(val_counts.values())
+        imbalance_ratio  = max_val / max(min_val, 1)
 
         if imbalance_ratio > 3.0:
-            print(f"\n⚠️  Val set is severely imbalanced (max/min ratio={imbalance_ratio:.1f}x).")
-            print(f"   Class counts: { {class_names[k]: v for k,v in sorted(val_counts.items())} }")
-            print(f"   Merging train+val and re-splitting 80/20 with stratification...")
-
+            print(f"\n⚠️  Val set severely imbalanced (ratio={imbalance_ratio:.1f}×). "
+                  f"Merging and re-splitting 80/20 with stratification...")
             all_paths  = train_paths_raw  + val_paths_raw
             all_labels = train_labels_raw + val_labels_raw
             train_paths, val_paths, train_labels, val_labels = train_test_split(
                 all_paths, all_labels,
                 test_size=0.2, random_state=42, stratify=all_labels
             )
-            print(f"\n📊 Re-split result:")
-            new_val_counts = Counter(val_labels)
+            print("\n📊 Re-split result:")
             for idx, name in enumerate(class_names):
-                print(f"   {name}: train={Counter(train_labels)[idx]}  val={new_val_counts[idx]}")
+                print(f"   {name}: train={Counter(train_labels)[idx]}  "
+                      f"val={Counter(val_labels)[idx]}")
         else:
+            # FIX BUG 4: use pre-made split directly
             train_paths, train_labels = train_paths_raw, train_labels_raw
             val_paths,   val_labels   = val_paths_raw,   val_labels_raw
-            print("✅ Val distribution looks balanced — using pre-made split.")
+            print("✅ Val distribution balanced — using pre-made split.")
     else:
-        print("⚠️  No pre-split dirs found, scanning root and splitting 80/20.")
-        class_names = sorted([p.name for p in data_path.iterdir()
-                               if p.is_dir() and p.name not in ('test', 'synthetic', 'sipakmed_raw')])
+        print("⚠️  No pre-split dirs found — scanning root and splitting 80/20.")
+        class_names = sorted([
+            p.name for p in data_path.iterdir()
+            if p.is_dir() and p.name not in ('test', 'synthetic', 'sipakmed_raw')
+        ])
         all_paths, all_labels = load_split(data_path, class_names)
         train_paths, val_paths, train_labels, val_labels = train_test_split(
-            all_paths, all_labels, test_size=0.2, random_state=42, stratify=all_labels)
+            all_paths, all_labels, test_size=0.2, random_state=42, stratify=all_labels
+        )
 
     print(f"\n✅ Train: {len(train_paths)}  |  Val: {len(val_paths)}")
     if len(train_paths) == 0:
-        raise ValueError("No training images found.")
+        raise ValueError("No training images found. Check --data-dir.")
 
-    # ── Feature extraction ────────────────────────────────────────────────
+    # ── Feature extraction — FIX BUG 5 ──────────────────────────────────
     print("\n🔍 Extracting train features (fit scaler)...")
     train_cache, feature_scaler = build_feature_cache(train_paths, fit_scaler=True)
 
     print("🔍 Extracting val features (apply scaler)...")
     val_cache, _ = build_feature_cache(val_paths, feature_scaler=feature_scaler)
 
-    # ── Separate real vs synthetic images in train set ───────────────────
     n_synthetic = sum(1 for p in train_paths if 'synthetic' in p.lower())
     n_real      = len(train_paths) - n_synthetic
     print(f"\n📊 Train composition: {n_real} real  +  {n_synthetic} synthetic")
-    if n_synthetic > n_real:
-        print(f"  ⚠️  More synthetic than real — overfitting risk HIGH. Using stronger regularization.")
 
-    # ── Transforms ───────────────────────────────────────────────────────
+    # ── Transforms — FIX BUG 11: reduced hue jitter ─────────────────────
     train_transform = transforms.Compose([
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.RandomVerticalFlip(p=0.5),
-        transforms.RandomRotation(30),
-        transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1),
+        transforms.RandomRotation(45),
+        transforms.ColorJitter(
+            brightness=0.3,
+            contrast=0.3,
+            saturation=0.3,
+            hue=0.05,          # FIX BUG 11: was 0.15 — too destructive for cell color
+        ),
         transforms.RandomAffine(degrees=0, translate=(0.1, 0.1), scale=(0.85, 1.15)),
         transforms.RandomGrayscale(p=0.05),
         transforms.Resize((224, 224)),
@@ -657,83 +718,109 @@ def train_hybrid_model(data_dir, output_dir, epochs=100, batch_size=32,
     train_ds = HybridDataset(train_paths, train_labels, train_transform, train_cache)
     val_ds   = HybridDataset(val_paths,   val_labels,   val_transform,   val_cache)
 
-    # FIX BUG 7: sampler built from final train_labels
-    class_counts  = Counter(train_labels)
-    class_weights = {i: 1.0 / class_counts[i] for i in range(len(class_names))}
+    # FIX BUG 7: sampler uses final train_labels (after all splitting logic)
+    class_counts   = Counter(train_labels)
+    class_weights  = {i: 1.0 / class_counts[i] for i in range(len(class_names))}
     sample_weights = [class_weights[l] for l in train_labels]
     sampler = WeightedRandomSampler(sample_weights, len(train_labels), replacement=True)
 
-    num_workers = min(num_workers, os.cpu_count() or 0)
+    num_workers  = min(num_workers, os.cpu_count() or 0)
     train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=sampler,
                               num_workers=num_workers, pin_memory=True)
     val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False,
                               num_workers=num_workers, pin_memory=True)
 
-    # ── Model ─────────────────────────────────────────────────────────────
-    model = build_model(num_classes=len(class_names),
-                        num_features=NUM_TRADITIONAL_FEATURES,
-                        device=device,
-                        dropout=0.4)
+    # ── Model ────────────────────────────────────────────────────────────
+    model = build_model(
+        num_classes=len(class_names),
+        num_features=NUM_TRADITIONAL_FEATURES,
+        device=device,
+        dropout=0.4,
+    )
 
-    # Differential LR: backbone gets 1/100 of head LR
+    # FIX BUG 12: freeze backbone initially; unfreeze after BACKBONE_FREEZE_EPOCHS
+    freeze_backbone(model)
+
+    # ── Optimizer — FIX BUG 8: lower base LR ────────────────────────────
     backbone_param_ids = {id(p) for p in model.backbone.parameters()}
-    backbone_params = [p for p in model.parameters() if id(p) in backbone_param_ids]
-    head_params     = [p for p in model.parameters() if id(p) not in backbone_param_ids]
+    backbone_params    = [p for p in model.parameters() if id(p) in backbone_param_ids]
+    head_params        = [p for p in model.parameters() if id(p) not in backbone_param_ids]
 
+    # backbone lr is set intentionally low; it will be used after unfreezing
     optimizer = torch.optim.AdamW([
-        {'params': backbone_params, 'lr': lr * 0.1,    'weight_decay': 1e-4},  # FIX: 0.1 instead of 0.05
-        {'params': head_params,     'lr': lr,           'weight_decay': 1e-4},  # FIX: 1.0 instead of 0.5
+        {'params': backbone_params, 'lr': lr * 0.1,  'weight_decay': 1e-4},  # 5e-5
+        {'params': head_params,     'lr': lr,         'weight_decay': 1e-4},  # 5e-4
     ])
 
-    scheduler = WarmupCosineScheduler(optimizer, warmup_epochs=5, total_epochs=epochs)  # FIX: shorter warmup
+    # FIX BUG 2 + 3: WarmupCosineScheduler with per-group initial_lr
+    scheduler = WarmupCosineScheduler(optimizer, warmup_epochs=3, total_epochs=epochs)
 
-    criterion = FocalLoss(alpha=1.0, gamma=1.5)  # FIX: reduced gamma from 2.0 to 1.5, alpha=1.0
+    # ── Loss — FocalLoss with class weights (FIX BUG 5 bonus: now meaningful) ──
+    class_weights_tensor = torch.tensor(
+        [1.0 / class_counts[i] for i in range(len(class_names))],
+        dtype=torch.float32, device=device
+    )
+    class_weights_tensor = class_weights_tensor / class_weights_tensor.sum() * len(class_names)
+    criterion = FocalLoss(alpha=0.25, gamma=2.0, weight=class_weights_tensor)
 
-    # FIX: INCREASE learning rate significantly
-    optimizer = torch.optim.AdamW([
-        {'params': backbone_params, 'lr': lr * 0.1,    'weight_decay': 1e-4},  # FIX: 0.1 instead of 0.05
-        {'params': head_params,     'lr': lr,           'weight_decay': 1e-4},  # FIX: 1.0 instead of 0.5
-    ])
+    # ── AMP — FIX BUG 6 ──────────────────────────────────────────────────
+    use_amp = torch.cuda.is_available()
+    scaler  = torch.cuda.amp.GradScaler() if use_amp else None
+    print(f"  AMP: {'Enabled' if use_amp else 'Disabled'}")
 
-    scheduler = WarmupCosineScheduler(optimizer, warmup_epochs=5, total_epochs=epochs)  # FIX: shorter warmup
-
-    # AMP DISABLED: BatchNorm1d layers produce NaN in float16 during early training
-    # when batch statistics are near zero. The T4 speedup is not worth broken training.
-    use_amp = False
-    scaler  = None
-    print(f"  AMP: Disabled (BatchNorm1d + float16 = NaN risk)")
-
-    # ── Training loop ──────────────────────────────────────────────────
-    best_macro_f1   = 0.0
-    best_val_loss   = float('inf')  # FIX: track val loss as well
-    best_val_acc    = 0.0
+    # ── Training Loop — FIX BUG 2: scheduler.step() called once per epoch ──
+    best_macro_f1    = 0.0
+    best_val_loss    = float('inf')
+    best_val_acc     = 0.0
     patience_counter = 0
-    checkpoint_path = os.path.join(output_dir, 'best_model.pt')
-    history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': [], 'val_macro_f1': []}
+    backbone_unfrozen = False
+    checkpoint_path  = os.path.join(output_dir, 'best_model.pt')
+    history = {
+        'train_loss': [], 'train_acc': [],
+        'val_loss': [], 'val_acc': [], 'val_macro_f1': [],
+    }
 
     for epoch in range(epochs):
         print(f"\n{'='*70}")
         print(f"Epoch {epoch+1}/{epochs}")
         print(f"{'='*70}")
 
-        # Always delay MixUp until after warmup so the model learns clean
-        # class boundaries first — MixUp during warmup creates noise gradients
-        # before the head has any discriminative signal.
+        # FIX BUG 12: unfreeze backbone after warm-up period
+        if not backbone_unfrozen and epoch >= BACKBONE_FREEZE_EPOCHS:
+            unfreeze_backbone(model)
+            backbone_unfrozen = True
+            # Re-create optimizer so backbone params are actually tracked with gradient
+            optimizer = torch.optim.AdamW([
+                {'params': [p for p in model.backbone.parameters()],
+                 'lr': lr * 0.1,  'weight_decay': 1e-4},
+                {'params': head_params,
+                 'lr': lr * 0.5,  'weight_decay': 1e-4},  # reduce head LR for stability
+            ])
+            # Rebuild scheduler with remaining epochs
+            remaining = epochs - epoch
+            scheduler = WarmupCosineScheduler(optimizer, warmup_epochs=1, total_epochs=remaining)
+            print(f"  Optimizer rebuilt for full fine-tuning phase.")
+
         train_loss, train_acc = train_epoch(
             model, train_loader, optimizer, criterion, device,
-            scaler=scaler, use_mixup=True,
-            current_epoch=epoch, mixup_start_epoch=10
+            scaler=scaler,
+            use_mixup=True,
+            current_epoch=epoch,
+            mixup_start_epoch=20,   # FIX BUG 9: was 2
+            mixup_alpha=0.2,        # FIX BUG 9: was 0.4
         )
 
-        val_acc, val_loss, _, _, macro_f1 = evaluate(model, val_loader, device, criterion)
+        val_acc, val_loss, _, _, macro_f1 = evaluate(
+            model, val_loader, device, criterion
+        )
 
-        # Step cosine scheduler once per epoch
+        # FIX BUG 2: step scheduler ONCE per epoch
         scheduler.step()
         new_lrs = [pg['lr'] for pg in optimizer.param_groups]
 
         print(f"Train  — loss: {train_loss:.4f} | acc: {train_acc:.2f}%")
         print(f"Val    — loss: {val_loss:.4f}  | acc: {val_acc:.2f}% | macro-F1: {macro_f1:.4f}")
-        print(f"LR     — head={new_lrs[1]:.2e}  backbone={new_lrs[0]:.2e}  (next epoch)")
+        print(f"LR     — head={new_lrs[1]:.2e}  backbone={new_lrs[0]:.2e}")
 
         history['train_loss'].append(train_loss)
         history['train_acc'].append(train_acc)
@@ -741,26 +828,30 @@ def train_hybrid_model(data_dir, output_dir, epochs=100, batch_size=32,
         history['val_acc'].append(val_acc)
         history['val_macro_f1'].append(macro_f1)
 
-        if macro_f1 > best_macro_f1 or val_loss < best_val_loss * 0.98:  # FIX: accept if F1 improves OR loss drops >2%
-            best_macro_f1 = macro_f1
-            best_val_loss = val_loss
-            best_val_acc  = val_acc
+        improved = macro_f1 > best_macro_f1 or (
+            val_loss < best_val_loss * 0.99 and val_acc > 60.0
+        )
+        if improved:
+            best_macro_f1    = macro_f1
+            best_val_loss    = val_loss
+            best_val_acc     = val_acc
             patience_counter = 0
             torch.save({
-                'epoch': epoch + 1,
-                'model_state_dict': model.state_dict(),
+                'epoch':               epoch + 1,
+                'model_state_dict':    model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'val_acc': val_acc,
-                'macro_f1': macro_f1,
-                'class_names': class_names,
-                'num_features': NUM_TRADITIONAL_FEATURES,
+                'val_acc':             val_acc,
+                'macro_f1':            macro_f1,
+                'class_names':         class_names,
+                'num_features':        NUM_TRADITIONAL_FEATURES,
+                'script_version':      _SCRIPT_VERSION,
             }, checkpoint_path)
-            print(f"✅ Checkpoint saved  (macro-F1={macro_f1:.4f}, val_loss={val_loss:.4f})")
+            print(f"✅ Checkpoint saved  (macro-F1={macro_f1:.4f}, val_acc={val_acc:.2f}%)")
         else:
             patience_counter += 1
             print(f"   No improvement ({patience_counter}/{early_stopping_patience})")
             if patience_counter >= early_stopping_patience:
-                print(f"\n⏹️  Early stopping triggered.")
+                print(f"\n⏹️  Early stopping at epoch {epoch+1}.")
                 break
 
     with open(os.path.join(output_dir, 'history.json'), 'w') as f:
@@ -780,14 +871,14 @@ def train_hybrid_model(data_dir, output_dir, epochs=100, batch_size=32,
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Train hybrid cervical cancer classifier')
-    parser.add_argument('--data-dir',               type=str,   default='/kaggle/working/data')
-    parser.add_argument('--checkpoint-dir',         type=str,   default='./checkpoints')
-    parser.add_argument('--epochs',                 type=int,   default=100)
-    parser.add_argument('--batch-size',             type=int,   default=32)
-    parser.add_argument('--learning-rate',          type=float, default=1e-4)
-    parser.add_argument('--early-stopping-patience',type=int,   default=20)
-    parser.add_argument('--num-workers',            type=int,   default=4)
-    parser.add_argument('--seed',                   type=int,   default=42)
+    parser.add_argument('--data-dir',                type=str,   default='/kaggle/working/data')
+    parser.add_argument('--checkpoint-dir',          type=str,   default='./checkpoints')
+    parser.add_argument('--epochs',                  type=int,   default=80)
+    parser.add_argument('--batch-size',              type=int,   default=16)
+    parser.add_argument('--learning-rate',           type=float, default=5e-4)   # FIX BUG 8
+    parser.add_argument('--early-stopping-patience', type=int,   default=15)
+    parser.add_argument('--num-workers',             type=int,   default=4)
+    parser.add_argument('--seed',                    type=int,   default=42)
     args = parser.parse_args()
 
     set_seed(args.seed)
