@@ -115,6 +115,7 @@ def set_seed(seed: int = 42):
 
 
 def resolve_data_dir(user_path: str) -> Path:
+    """Resolve data directory from multiple possible locations."""
     candidates = [
         Path(user_path),
         PROJECT_ROOT / user_path,
@@ -124,7 +125,14 @@ def resolve_data_dir(user_path: str) -> Path:
     ]
     for p in candidates:
         if p.exists() and p.is_dir():
-            return p.resolve()
+            print(f"✅ Data directory found: {p}")
+            return p
+
+    # FIXED: Print all candidates for debugging
+    print(f"❌ Data directory not found. Checked:")
+    for p in candidates:
+        print(f"   - {p} (exists: {p.exists()})")
+
     raise FileNotFoundError(
         f"Data directory not found. Checked: {[str(c) for c in candidates]}"
     )
@@ -455,24 +463,47 @@ def train_hybrid_model(data_dir, output_dir, epochs=80, batch_size=16, lr=1e-3):
     
     os.makedirs(output_dir, exist_ok=True)
     
-    # Load image paths and labels
-    image_paths = sorted([
-        str(p) for p in Path(data_dir).rglob('*.jpg')
-        if p.parent.name in ['Dysplasia', 'Koilocytosis', 'Metaplasia', 'Parabasal', 'Superficial']
-    ])
+    # FIXED: Handle both .jpg and .png, add debug output
+    data_path = Path(data_dir)
+    print(f"📁 Looking for images in: {data_path}")
+    print(f"   Directory exists: {data_path.exists()}")
     
-    labels = [
-        ['Dysplasia', 'Koilocytosis', 'Metaplasia', 'Parabasal', 'Superficial'].index(
-            Path(p).parent.name
-        ) for p in image_paths
-    ]
+    if data_path.exists():
+        print(f"   Contents: {list(data_path.iterdir())[:5]}")
+    
+    # Load image paths and labels - FIXED: support both .jpg and .png
+    class_names = ['Dysplasia', 'Koilocytosis', 'Metaplasia', 'Parabasal', 'Superficial']
+    image_paths = []
+    labels = []
+    
+    for class_idx, class_name in enumerate(class_names):
+        class_dir = data_path / class_name
+        if not class_dir.exists():
+            print(f"⚠️  Warning: Class directory not found: {class_dir}")
+            continue
+        
+        # FIXED: match both .jpg and .png files
+        img_files = sorted(list(class_dir.glob('*.jpg')) + list(class_dir.glob('*.png')))
+        print(f"   {class_name}: {len(img_files)} images")
+        
+        for img_path in img_files:
+            image_paths.append(str(img_path))
+            labels.append(class_idx)
+    
+    print(f"\n✅ Total images found: {len(image_paths)}")
+    
+    if len(image_paths) == 0:
+        raise ValueError(
+            f"No images found in {data_dir}. "
+            f"Expected structure: {data_dir}/Dysplasia/*.jpg, etc."
+        )
     
     # Train/val split
     train_paths, val_paths, train_labels, val_labels = train_test_split(
         image_paths, labels, test_size=0.2, random_state=42, stratify=labels
     )
     
-    print(f"Train: {len(train_paths)}, Val: {len(val_paths)}")
+    print(f"   Train: {len(train_paths)}, Val: {len(val_paths)}")
     
     # Image transforms
     train_transform = transforms.Compose([
