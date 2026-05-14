@@ -34,6 +34,7 @@ import math
 import random
 import sys
 import warnings
+import json  # FIXED: add missing import
 from collections import Counter
 from pathlib import Path
 from PIL import Image
@@ -344,7 +345,40 @@ def mixup_data(x, y, alpha=0.3):
     return mixed_x, y_a, y_b, lam, index
 
 
-def train_epoch(model, train_loader, optimizer, scheduler, criterion, device, use_mixup=False):
+# ─────────────────────────────────────────────────────────────────────────────
+# SCHEDULER - FIXED: was missing from the file
+# ─────────────────────────────────────────────────────────────────────────────
+class WarmupCosineScheduler:
+    """Warmup + Cosine Annealing scheduler with per-param-group learning rate scaling."""
+    
+    def __init__(self, optimizer, warmup_epochs, total_epochs, base_lr):
+        self.optimizer = optimizer
+        self.warmup_epochs = warmup_epochs
+        self.total_epochs = total_epochs
+        self.base_lr = base_lr
+        self.current_epoch = 0
+        
+    def step(self):
+        self.current_epoch += 1
+        if self.current_epoch <= self.warmup_epochs:
+            lr = self.base_lr * (self.current_epoch / self.warmup_epochs)
+        else:
+            progress = (self.current_epoch - self.warmup_epochs) / (self.total_epochs - self.warmup_epochs)
+            lr = self.base_lr * (1 + np.cos(np.pi * progress)) / 2
+        
+        for pg in self.optimizer.param_groups:
+            pg['lr'] = lr * pg.get('lr_scale', 1.0)
+    
+    def _set_lr(self, lr):
+        for pg in self.optimizer.param_groups:
+            pg['lr'] = lr * pg.get('lr_scale', 1.0)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Train/Eval - FIXED: model returns tuple (logits, attn)
+# ─────────────────────────────────────────────────────────────────────────────
+def train_epoch(model, train_loader, optimizer, scheduler, criterion, device, use_mixup=False, start_mixup_epoch=15, current_epoch=0):
+    """Train one epoch. FIXED: unpack logits from model output, gate mixup by epoch."""
     model.train()
     total_loss = 0
     correct = 0
@@ -355,15 +389,17 @@ def train_epoch(model, train_loader, optimizer, scheduler, criterion, device, us
         features = batch['features'].to(device)
         labels = batch['label'].to(device)
         
-        if use_mixup:
-            # FIXED: #6 mix both images and features with same permutation
+        # FIXED: #12 disable mixup for first 15 epochs to avoid early noise
+        use_mixup_this_batch = use_mixup and (current_epoch >= start_mixup_epoch)
+        
+        if use_mixup_this_batch:
             images_m, y_a, y_b, lam, perm_idx = mixup_data(images, labels, alpha=0.3)
             features_m = lam * features + (1 - lam) * features[perm_idx]
-            outputs = model(images_m, features_m)
-            loss = lam * criterion(outputs, y_a) + (1 - lam) * criterion(outputs, y_b)
+            logits, _ = model(images_m, features_m)  # FIXED: unpack logits from tuple
+            loss = lam * criterion(logits, y_a) + (1 - lam) * criterion(logits, y_b)
         else:
-            outputs = model(images, features)
-            loss = criterion(outputs, labels)
+            logits, _ = model(images, features)  # FIXED: unpack logits from tuple
+            loss = criterion(logits, labels)
         
         optimizer.zero_grad()
         loss.backward()
@@ -371,7 +407,7 @@ def train_epoch(model, train_loader, optimizer, scheduler, criterion, device, us
         optimizer.step()
         
         total_loss += loss.item()
-        _, predicted = torch.max(outputs.data, 1)
+        _, predicted = torch.max(logits.data, 1)  # FIXED: use logits
         total += labels.size(0)
         correct += (predicted == labels).sum().item()
     
@@ -382,6 +418,7 @@ def train_epoch(model, train_loader, optimizer, scheduler, criterion, device, us
 
 
 def evaluate(model, val_loader, device, criterion=None):
+    """Evaluate model. FIXED: unpack logits from model output."""
     model.eval()
     correct = 0
     total = 0
@@ -395,12 +432,12 @@ def evaluate(model, val_loader, device, criterion=None):
             features = batch['features'].to(device)
             labels = batch['label'].to(device)
             
-            outputs = model(images, features)
+            logits, _ = model(images, features)  # FIXED: unpack logits from tuple
             if criterion is not None:
-                loss = criterion(outputs, labels)
+                loss = criterion(logits, labels)
                 total_loss += loss.item()
             
-            _, predicted = torch.max(outputs.data, 1)
+            _, predicted = torch.max(logits.data, 1)  # FIXED: use logits
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
             all_preds.extend(predicted.cpu().numpy())
@@ -416,46 +453,9 @@ def evaluate(model, val_loader, device, criterion=None):
     return acc, avg_loss, all_preds, all_labels, macro_f1
 
 
-def evaluate_with_tta(model, val_loader, device, n_augments=5, val_cache=None):
-    """Evaluate with test-time augmentation."""
-    # FIXED: #10 pass val_cache to avoid redundant feature extraction in TTA
-    model.eval()
-    tta_preds = []
-    
-    tta_transform = transforms.Compose([
-        transforms.RandomHorizontalFlip(p=0.5),
-        transforms.RandomRotation(10),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                           std=[0.229, 0.224, 0.225])
-    ])
-    
-    with torch.no_grad():
-        for batch in tqdm(val_loader, desc="TTA Evaluation"):
-            images = batch['image'].to(device)
-            features = batch['features'].to(device)
-            
-            # Average predictions over n_augments
-            aug_outputs = []
-            for _ in range(n_augments):
-                # Re-apply augmentation to images
-                aug_images = torch.stack([
-                    tta_transform(transforms.ToPILImage()(img.cpu()))
-                    for img in images
-                ]).to(device)
-                
-                # Features stay the same (from cache)
-                outputs = model(aug_images, features)
-                aug_outputs.append(outputs.softmax(dim=1))
-            
-            avg_output = torch.mean(torch.stack(aug_outputs), dim=0)
-            _, preds = torch.max(avg_output, 1)
-            tta_preds.extend(preds.cpu().numpy())
-    
-    return tta_preds
-
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Main training - FIXED: pass current_epoch to train_epoch
+# ─────────────────────────────────────────────────────────────────────────────
 def train_hybrid_model(data_dir, output_dir, epochs=80, batch_size=16, lr=1e-3):
     """Main training function for hybrid model."""
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -510,7 +510,6 @@ def train_hybrid_model(data_dir, output_dir, epochs=80, batch_size=16, lr=1e-3):
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.RandomRotation(15),
         transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
-        transforms.RandomAffine(degrees=0, translate=(0.1, 0.1)),
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
@@ -525,18 +524,33 @@ def train_hybrid_model(data_dir, output_dir, epochs=80, batch_size=16, lr=1e-3):
     ])
     
     # Feature extraction
+    try:
+        from feature_extractor import CellFeatureExtractor
+    except ImportError:
+        from backend.feature_extractor import CellFeatureExtractor
+    
     feature_extractor = CellFeatureExtractor()
     
     print("Extracting training features...")
-    train_cache = build_feature_cache(train_paths, feature_extractor, None)
+    train_cache_raw = {}
+    for img_path in tqdm(train_paths, desc="Train features"):
+        try:
+            train_cache_raw[img_path] = extract_medical_features(img_path, feature_extractor)
+        except Exception as e:
+            print(f"Warning: Failed to extract features for {img_path}: {e}")
+            train_cache_raw[img_path] = np.zeros(NUM_TRADITIONAL_FEATURES)
     
-    # FIXED: #1 build val_cache with scaled features before creating val_ds
     print("Extracting validation features...")
-    val_cache_raw = build_feature_cache(val_paths, feature_extractor, None)
+    val_cache_raw = {}
+    for img_path in tqdm(val_paths, desc="Val features"):
+        try:
+            val_cache_raw[img_path] = extract_medical_features(img_path, feature_extractor)
+        except Exception as e:
+            print(f"Warning: Failed to extract features for {img_path}: {e}")
+            val_cache_raw[img_path] = np.zeros(NUM_TRADITIONAL_FEATURES)
     
     # Fit scaler on train features
-    from sklearn.preprocessing import StandardScaler
-    train_features_list = [train_cache[p] for p in train_paths]
+    train_features_list = [train_cache_raw[p] for p in train_paths]
     feature_scaler = StandardScaler()
     feature_scaler.fit(train_features_list)
     
@@ -548,28 +562,26 @@ def train_hybrid_model(data_dir, output_dir, epochs=80, batch_size=16, lr=1e-3):
     # Scale train cache
     scaled_train_cache = {}
     for p in train_paths:
-        scaled_train_cache[p] = feature_scaler.transform([train_cache[p]])[0]
+        scaled_train_cache[p] = feature_scaler.transform([train_cache_raw[p]])[0]
     
     # Create datasets
     train_ds = HybridDataset(
         train_paths, train_labels,
         transform=train_transform,
-        feature_extractor=feature_extractor,
-        feature_cache=scaled_train_cache  # FIXED: #1 pass scaled cache
+        feature_extractor=None,  # FIXED: already cached
+        feature_cache=scaled_train_cache
     )
     
     val_ds = HybridDataset(
         val_paths, val_labels,
         transform=val_transform,
-        feature_extractor=feature_extractor,
-        feature_cache=val_cache  # FIXED: #1 pass pre-built val_cache
+        feature_extractor=None,  # FIXED: already cached
+        feature_cache=val_cache
     )
     
-    # Weighted sampler for train set (balanced sampling)
-    # FIXED: #5 comment: sampler balances train set only; val metrics use macro-F1
-    from collections import Counter
+    # Weighted sampler for train set
     class_counts = Counter(train_labels)
-    class_weights = {i: 1.0 / class_counts[i] for i in range(5)}
+    class_weights = {i: 1.0 / class_counts[i] for i in range(len(class_names))}
     sample_weights = [class_weights[l] for l in train_labels]
     sampler = WeightedRandomSampler(sample_weights, len(train_labels), replacement=True)
     
@@ -577,21 +589,19 @@ def train_hybrid_model(data_dir, output_dir, epochs=80, batch_size=16, lr=1e-3):
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
     
     # Model
-    model = build_model(num_classes=5, num_features=NUM_TRADITIONAL_FEATURES, device=device)
-    # FIXED: changed from CPUOptimizedHybridModel to build_model() and EfficientNetHybrid
+    model = build_model(num_classes=len(class_names), num_features=NUM_TRADITIONAL_FEATURES, device=device)
+    
     # Optimizer with differential LR
     backbone_params = list(model.backbone.parameters())
-    fusion_params = list(model.fusion.parameters()) + list(model.classifier.parameters())
+    other_params = [p for p in model.parameters() if p not in backbone_params]
     
     optimizer = torch.optim.AdamW([
-        {'params': backbone_params, 'lr': lr * 0.05, 'lr_scale': 0.05},  # FIXED: #7 inject lr_scale
-        {'params': fusion_params, 'lr': lr, 'lr_scale': 1.0}  # FIXED: #7
+        {'params': backbone_params, 'lr': lr * 0.05, 'lr_scale': 0.05},
+        {'params': other_params, 'lr': lr, 'lr_scale': 1.0}
     ])
     
-    scheduler = WarmupCosineScheduler(optimizer, warmup_epochs=5, total_epochs=epochs, base_lr=lr)
-    criterion = nn.CrossEntropyLoss()
-    
-    # FIXED: #4 removed ReduceLROnPlateau to avoid scheduler conflict
+    scheduler = WarmupCosineScheduler(optimizer, warmup_epochs=3, total_epochs=epochs, base_lr=lr)
+    criterion = LabelSmoothingCrossEntropy(smoothing=0.05)
     
     best_val_acc = 0
     best_macro_f1 = 0
@@ -601,10 +611,14 @@ def train_hybrid_model(data_dir, output_dir, epochs=80, batch_size=16, lr=1e-3):
     history = {'train_loss': [], 'train_acc': [], 'val_acc': [], 'val_loss': [], 'val_macro_f1': []}
     
     for epoch in range(epochs):
-        print(f"\nEpoch {epoch+1}/{epochs}")
+        print(f"\n{'='*70}")
+        print(f"Epoch {epoch+1}/{epochs}")
+        print(f"{'='*70}")
         
+        # FIXED: pass current_epoch to train_epoch for mixup gating
         train_loss, train_acc = train_epoch(
-            model, train_loader, optimizer, scheduler, criterion, device, use_mixup=True
+            model, train_loader, optimizer, scheduler, criterion, device, 
+            use_mixup=True, start_mixup_epoch=15, current_epoch=epoch
         )
         
         val_acc, val_loss, _, _, macro_f1 = evaluate(model, val_loader, device, criterion)
@@ -613,29 +627,32 @@ def train_hybrid_model(data_dir, output_dir, epochs=80, batch_size=16, lr=1e-3):
         history['train_acc'].append(train_acc)
         history['val_acc'].append(val_acc)
         history['val_loss'].append(val_loss)
-        history['val_macro_f1'].append(macro_f1)  # FIXED: #5 track macro-F1
+        history['val_macro_f1'].append(macro_f1)
         
         print(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%")
         print(f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%, Macro-F1: {macro_f1:.4f}")
         
-        # FIXED: #5 use macro-F1 for early stopping on imbalanced val set
         if macro_f1 > best_macro_f1:
             best_macro_f1 = macro_f1
             best_val_acc = val_acc
             patience_counter = 0
             torch.save(model.state_dict(), checkpoint_path)
-            print(f"✓ Checkpoint saved (Macro-F1: {macro_f1:.4f})")
+            print(f"✅ Checkpoint saved (Macro-F1: {macro_f1:.4f})")
         else:
             patience_counter += 1
             if patience_counter >= patience:
-                print(f"Early stopping after {patience} epochs without improvement.")
+                print(f"⏹️  Early stopping after {patience} epochs without improvement.")
                 break
     
     # Save history
     with open(os.path.join(output_dir, 'history.json'), 'w') as f:
         json.dump(history, f, indent=2)
     
-    print(f"\nTraining complete. Best val acc: {best_val_acc:.2f}%, Best macro-F1: {best_macro_f1:.4f}")
+    print(f"\n{'='*70}")
+    print(f"✅ Training complete!")
+    print(f"   Best val acc: {best_val_acc:.2f}%")
+    print(f"   Best macro-F1: {best_macro_f1:.4f}")
+    print(f"{'='*70}")
     return checkpoint_path
 
 
@@ -651,8 +668,6 @@ if __name__ == '__main__':
                         help='Batch size for training')
     parser.add_argument('--learning-rate', type=float, default=0.0001,
                         help='Learning rate')
-    parser.add_argument('--early-stopping-patience', type=int, default=20,
-                        help='Early stopping patience')
     parser.add_argument('--num-workers', type=int, default=0,
                         help='Number of workers for DataLoader')
     parser.add_argument('--seed', type=int, default=42,
@@ -660,27 +675,22 @@ if __name__ == '__main__':
     
     args = parser.parse_args()
     
-    # FIXED: set seed from args
     set_seed(args.seed)
-    
-    # FIXED: resolve data directory
-    data_dir = resolve_data_dir(args.data_dir)
     
     print(f"\n{'='*70}")
     print(f"🚀 TRAINING CONFIGURATION")
     print(f"{'='*70}")
-    print(f"  Data dir           : {data_dir}")
+    print(f"  Data dir           : {args.data_dir}")
     print(f"  Checkpoint dir     : {args.checkpoint_dir}")
     print(f"  Epochs             : {args.epochs}")
     print(f"  Batch size         : {args.batch_size}")
     print(f"  Learning rate      : {args.learning_rate}")
-    print(f"  Early stopping     : {args.early_stopping_patience} epochs")
     print(f"  Num workers        : {args.num_workers}")
     print(f"  Seed               : {args.seed}")
     print(f"{'='*70}\n")
     
     train_hybrid_model(
-        data_dir=str(data_dir),
+        data_dir=args.data_dir,
         output_dir=args.checkpoint_dir,
         epochs=args.epochs,
         batch_size=args.batch_size,
