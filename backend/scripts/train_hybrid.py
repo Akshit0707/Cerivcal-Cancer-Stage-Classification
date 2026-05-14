@@ -673,7 +673,9 @@ def train_hybrid_model(data_dir, output_dir, epochs=80, batch_size=16, lr=1e-3, 
     
     # Optimizer with differential LR
     backbone_params = list(model.backbone.parameters())
-    other_params = [p for p in model.parameters() if p not in backbone_params]
+    # FIXED: use id() to compare parameter identity, not tensor equality
+    backbone_param_ids = {id(p) for p in backbone_params}
+    other_params = [p for p in model.parameters() if id(p) not in backbone_param_ids]
     
     optimizer = torch.optim.AdamW([
         {'params': backbone_params, 'lr': lr * 0.05, 'lr_scale': 0.05},
