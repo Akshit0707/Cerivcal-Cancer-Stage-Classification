@@ -85,7 +85,7 @@ from PIL import Image
 
 import numpy as np
 from tqdm import tqdm
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, RobustScaler
 from sklearn.metrics import classification_report
 import torch
 import torch.nn as nn
@@ -472,16 +472,11 @@ def sanitize_features(arr: np.ndarray) -> np.ndarray:
 
 def build_feature_cache(image_paths, feature_scaler=None, fit_scaler=False):
     """
-    Extract, sanitize, scale and cache features for a list of image paths.
-
-    NaN chain: extract_medical_features() can return NaN (e.g. division by zero
-    in compactness = 4π·area/perimeter² when perimeter≈0). Those NaNs propagate
-    into StandardScaler.fit() → mean_ and scale_ become NaN → every transformed
-    sample is NaN → model loss is NaN.
-
-    Fix: sanitize every raw feature vector (nan→0, inf→0, clip) BEFORE fitting
-    the scaler and BEFORE storing in the cache.
+    Extract, sanitize, scale and cache features.
+    FIX: Use RobustScaler instead of StandardScaler to handle outliers.
     """
+    from sklearn.preprocessing import RobustScaler
+    
     raw = {}
     n_bad = 0
     for img_path in tqdm(image_paths, desc="Extracting features", leave=False):
@@ -499,27 +494,24 @@ def build_feature_cache(image_paths, feature_scaler=None, fit_scaler=False):
         print(f"  ⚠️  {n_bad}/{len(image_paths)} images used zero-vector fallback")
 
     if fit_scaler:
-        all_feats = np.stack([raw[p] for p in image_paths])  # (N, 30)
-        # Sanity-check: no NaN should survive sanitize_features
+        all_feats = np.stack([raw[p] for p in image_paths])
         if np.isnan(all_feats).any():
-            print("  ⚠️  NaN in feature matrix after sanitization — forcing to 0")
+            print("  ⚠️  NaN in feature matrix — forcing to 0")
             all_feats = np.nan_to_num(all_feats, nan=0.0)
-        feature_scaler = StandardScaler()
+        
+        # FIX: Use RobustScaler (percentile-based) instead of StandardScaler
+        feature_scaler = RobustScaler(quantile_range=(10.0, 90.0))
         feature_scaler.fit(all_feats)
-        # Guard against zero-variance columns → scale_ = 0 → division by zero
-        feature_scaler.scale_ = np.where(
-            feature_scaler.scale_ < 1e-8, 1.0, feature_scaler.scale_
-        )
-        print(f"  ✅  Scaler fit: mean range [{feature_scaler.mean_.min():.3f}, "
-              f"{feature_scaler.mean_.max():.3f}], "
-              f"scale range [{feature_scaler.scale_.min():.3f}, {feature_scaler.scale_.max():.3f}]")
+        print(f"  ✅  RobustScaler fit: center range [{feature_scaler.center_.min():.2f}, "
+              f"{feature_scaler.center_.max():.2f}]")
 
     cache = {}
     for p in image_paths:
         if feature_scaler is not None:
             scaled = feature_scaler.transform([raw[p]])[0]
-            scaled = np.clip(scaled, -5.0, 5.0)   # cap at ±5σ — outlier images won't dominate
-            scaled = sanitize_features(scaled)     # final NaN guard after scaling
+            # FIX: Stricter clipping at ±3σ (99.7% of normal distribution)
+            scaled = np.clip(scaled, -3.0, 3.0)
+            scaled = sanitize_features(scaled)
             cache[p] = scaled
         else:
             cache[p] = raw[p]
@@ -668,16 +660,11 @@ def train_hybrid_model(data_dir, output_dir, epochs=100, batch_size=32,
     head_params     = [p for p in model.parameters() if id(p) not in backbone_param_ids]
 
     optimizer = torch.optim.AdamW([
-        # FIX: backbone at 50% of head LR — 1e-6 was too small to adapt ImageNet→microscopy
-        {'params': backbone_params, 'lr': lr * 0.5,   'weight_decay': 1e-4},  # 5e-5
-        {'params': head_params,     'lr': lr,           'weight_decay': 1e-4},  # 1e-4
+        {'params': backbone_params, 'lr': lr * 0.1,   'weight_decay': 1e-4},  # FIX: reduced to 0.1
+        {'params': head_params,     'lr': lr,           'weight_decay': 1e-4},
     ])
 
-    # Single scheduler: WarmupCosine only.
-    # ReduceLROnPlateau was removed — it modifies pg['lr'] which WarmupCosine
-    # reads as initial_lr on the next step, causing the LR to oscillate
-    # (observed: 1e-4 → 2e-5 → 4e-5 → ... instead of smooth warmup→decay).
-    scheduler = WarmupCosineScheduler(optimizer, warmup_epochs=5, total_epochs=epochs)
+    scheduler = WarmupCosineScheduler(optimizer, warmup_epochs=10, total_epochs=epochs)  # FIX: longer warmup
 
     criterion = LabelSmoothingCrossEntropy(smoothing=0.05)
 
@@ -689,6 +676,7 @@ def train_hybrid_model(data_dir, output_dir, epochs=100, batch_size=32,
 
     # ── Training loop ──────────────────────────────────────────────────
     best_macro_f1   = 0.0
+    best_val_loss   = float('inf')  # FIX: track val loss as well
     best_val_acc    = 0.0
     patience_counter = 0
     checkpoint_path = os.path.join(output_dir, 'best_model.pt')
@@ -724,8 +712,9 @@ def train_hybrid_model(data_dir, output_dir, epochs=100, batch_size=32,
         history['val_acc'].append(val_acc)
         history['val_macro_f1'].append(macro_f1)
 
-        if macro_f1 > best_macro_f1:
+        if macro_f1 > best_macro_f1 or val_loss < best_val_loss * 0.98:  # FIX: accept if F1 improves OR loss drops >2%
             best_macro_f1 = macro_f1
+            best_val_loss = val_loss
             best_val_acc  = val_acc
             patience_counter = 0
             torch.save({
@@ -737,7 +726,7 @@ def train_hybrid_model(data_dir, output_dir, epochs=100, batch_size=32,
                 'class_names': class_names,
                 'num_features': NUM_TRADITIONAL_FEATURES,
             }, checkpoint_path)
-            print(f"✅ Checkpoint saved  (macro-F1={macro_f1:.4f}, val_acc={val_acc:.2f}%)")
+            print(f"✅ Checkpoint saved  (macro-F1={macro_f1:.4f}, val_loss={val_loss:.4f})")
         else:
             patience_counter += 1
             print(f"   No improvement ({patience_counter}/{early_stopping_patience})")
