@@ -661,12 +661,11 @@ def train_hybrid_model(data_dir, output_dir, epochs=100, batch_size=32,
         {'params': head_params,     'lr': lr,          'weight_decay': 1e-4},  # 1e-4
     ])
 
-    # FIX BUG 2: scheduler stepped once/epoch, stores initial_lr per group
+    # Single scheduler: WarmupCosine only.
+    # ReduceLROnPlateau was removed — it modifies pg['lr'] which WarmupCosine
+    # reads as initial_lr on the next step, causing the LR to oscillate
+    # (observed: 1e-4 → 2e-5 → 4e-5 → ... instead of smooth warmup→decay).
     scheduler = WarmupCosineScheduler(optimizer, warmup_epochs=5, total_epochs=epochs)
-
-    # Plateau scheduler as safety net
-    plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', factor=0.5, patience=7)
 
     criterion = LabelSmoothingCrossEntropy(smoothing=0.05)
 
@@ -684,9 +683,8 @@ def train_hybrid_model(data_dir, output_dir, epochs=100, batch_size=32,
     history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': [], 'val_macro_f1': []}
 
     for epoch in range(epochs):
-        lrs = [pg['lr'] for pg in optimizer.param_groups]
         print(f"\n{'='*70}")
-        print(f"Epoch {epoch+1}/{epochs}  |  LR head={lrs[1]:.2e}  backbone={lrs[0]:.2e}")
+        print(f"Epoch {epoch+1}/{epochs}")
         print(f"{'='*70}")
 
         train_loss, train_acc = train_epoch(
@@ -697,22 +695,19 @@ def train_hybrid_model(data_dir, output_dir, epochs=100, batch_size=32,
 
         val_acc, val_loss, _, _, macro_f1 = evaluate(model, val_loader, device, criterion)
 
-        # FIX BUG 2: step schedulers ONCE per epoch here, not inside train_epoch
+        # Step cosine scheduler once per epoch
         scheduler.step()
-        prev_lr = optimizer.param_groups[1]['lr']
-        plateau_scheduler.step(macro_f1)
-        new_lr = optimizer.param_groups[1]['lr']
-        if new_lr < prev_lr:
-            print(f"  📉 ReduceLROnPlateau: head LR {prev_lr:.2e} → {new_lr:.2e}")
+        new_lrs = [pg['lr'] for pg in optimizer.param_groups]
+
+        print(f"Train  — loss: {train_loss:.4f} | acc: {train_acc:.2f}%")
+        print(f"Val    — loss: {val_loss:.4f}  | acc: {val_acc:.2f}% | macro-F1: {macro_f1:.4f}")
+        print(f"LR     — head={new_lrs[1]:.2e}  backbone={new_lrs[0]:.2e}  (next epoch)")
 
         history['train_loss'].append(train_loss)
         history['train_acc'].append(train_acc)
         history['val_loss'].append(val_loss)
         history['val_acc'].append(val_acc)
         history['val_macro_f1'].append(macro_f1)
-
-        print(f"Train  — loss: {train_loss:.4f} | acc: {train_acc:.2f}%")
-        print(f"Val    — loss: {val_loss:.4f}  | acc: {val_acc:.2f}% | macro-F1: {macro_f1:.4f}")
 
         if macro_f1 > best_macro_f1:
             best_macro_f1 = macro_f1
