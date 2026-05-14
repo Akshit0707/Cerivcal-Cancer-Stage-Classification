@@ -142,18 +142,18 @@ def set_seed(seed: int = 42):
 # ─────────────────────────────────────────────────────────────────────────────
 class FeatureMLP(nn.Module):
     """Deeper MLP for the 30-dim traditional feature branch with residual."""
-    def __init__(self, in_dim: int, out_dim: int = 128, dropout: float = 0.3):
+    def __init__(self, in_dim: int, out_dim: int = 256, dropout: float = 0.3):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(in_dim, 256),
-            nn.BatchNorm1d(256),
+            nn.Linear(in_dim, 512),
+            nn.BatchNorm1d(512),
             nn.ReLU(inplace=True),
             nn.Dropout(dropout),
-            nn.Linear(256, 256),
-            nn.BatchNorm1d(256),
+            nn.Linear(512, 512),
+            nn.BatchNorm1d(512),
             nn.ReLU(inplace=True),
             nn.Dropout(dropout),
-            nn.Linear(256, out_dim),
+            nn.Linear(512, out_dim),
             nn.BatchNorm1d(out_dim),
             nn.ReLU(inplace=True),
         )
@@ -165,7 +165,7 @@ class FeatureMLP(nn.Module):
 
 class EfficientNetHybrid(nn.Module):
     """EfficientNet-B3 backbone + traditional feature MLP, fused with attention."""
-    def __init__(self, num_classes: int, num_features: int = 30, dropout: float = 0.4):
+    def __init__(self, num_classes: int, num_features: int = 30, dropout: float = 0.5):
         super().__init__()
         try:
             from torchvision.models import efficientnet_b3, EfficientNet_B3_Weights
@@ -181,25 +181,30 @@ class EfficientNetHybrid(nn.Module):
             self.backbone = backbone
 
         self.cnn_out_dim = cnn_out_dim
-        feat_out_dim = 128
+        feat_out_dim = 256
 
         self.feature_mlp = FeatureMLP(num_features, feat_out_dim, dropout=0.3)
 
         fusion_dim = cnn_out_dim + feat_out_dim
 
         self.attention = nn.Sequential(
-            nn.Linear(fusion_dim, 64),
+            nn.Linear(fusion_dim, 128),
             nn.ReLU(inplace=True),
-            nn.Linear(64, 2),
+            nn.Dropout(0.2),
+            nn.Linear(128, 2),
             nn.Softmax(dim=-1),
         )
 
         self.classifier = nn.Sequential(
             nn.Dropout(dropout),
-            nn.Linear(fusion_dim, 512),
-            nn.BatchNorm1d(512),
+            nn.Linear(fusion_dim, 1024),
+            nn.BatchNorm1d(1024),
             nn.ReLU(inplace=True),
             nn.Dropout(dropout / 2),
+            nn.Linear(1024, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout / 4),
             nn.Linear(512, num_classes),
         )
 
@@ -660,13 +665,13 @@ def train_hybrid_model(data_dir, output_dir, epochs=100, batch_size=32,
     head_params     = [p for p in model.parameters() if id(p) not in backbone_param_ids]
 
     optimizer = torch.optim.AdamW([
-        {'params': backbone_params, 'lr': lr * 0.1,   'weight_decay': 1e-4},  # FIX: reduced to 0.1
-        {'params': head_params,     'lr': lr,           'weight_decay': 1e-4},
+        {'params': backbone_params, 'lr': lr * 0.05,   'weight_decay': 1e-4},  # FIX: 0.05 instead of 0.1
+        {'params': head_params,     'lr': lr * 0.5,     'weight_decay': 1e-4},  # FIX: 0.5 instead of 1.0
     ])
 
-    scheduler = WarmupCosineScheduler(optimizer, warmup_epochs=10, total_epochs=epochs)  # FIX: longer warmup
+    scheduler = WarmupCosineScheduler(optimizer, warmup_epochs=15, total_epochs=epochs)  # FIX: longer warmup
 
-    criterion = LabelSmoothingCrossEntropy(smoothing=0.05)
+    criterion = FocalLoss(alpha=0.25, gamma=2.0)
 
     # AMP DISABLED: BatchNorm1d layers produce NaN in float16 during early training
     # when batch statistics are near zero. The T4 speedup is not worth broken training.
