@@ -456,7 +456,7 @@ def evaluate(model, val_loader, device, criterion=None):
 # ─────────────────────────────────────────────────────────────────────────────
 # Main training - FIXED: pass current_epoch to train_epoch
 # ─────────────────────────────────────────────────────────────────────────────
-def train_hybrid_model(data_dir, output_dir, epochs=80, batch_size=16, lr=1e-3):
+def train_hybrid_model(data_dir, output_dir, epochs=80, batch_size=16, lr=1e-3, early_stopping_patience=15):
     """Main training function for hybrid model."""
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
@@ -605,7 +605,7 @@ def train_hybrid_model(data_dir, output_dir, epochs=80, batch_size=16, lr=1e-3):
     
     best_val_acc = 0
     best_macro_f1 = 0
-    patience = 15
+    patience = early_stopping_patience  # FIXED: use parameter instead of hardcoded
     patience_counter = 0
     checkpoint_path = os.path.join(output_dir, 'best_model.pt')
     history = {'train_loss': [], 'train_acc': [], 'val_acc': [], 'val_loss': [], 'val_macro_f1': []}
@@ -668,6 +668,9 @@ if __name__ == '__main__':
                         help='Batch size for training')
     parser.add_argument('--learning-rate', type=float, default=0.0001,
                         help='Learning rate')
+    # FIXED: add missing --early-stopping-patience argument
+    parser.add_argument('--early-stopping-patience', type=int, default=15,
+                        help='Early stopping patience (epochs without improvement)')
     parser.add_argument('--num-workers', type=int, default=0,
                         help='Number of workers for DataLoader')
     parser.add_argument('--seed', type=int, default=42,
@@ -680,19 +683,24 @@ if __name__ == '__main__':
     print(f"\n{'='*70}")
     print(f"🚀 TRAINING CONFIGURATION")
     print(f"{'='*70}")
-    print(f"  Data dir           : {args.data_dir}")
-    print(f"  Checkpoint dir     : {args.checkpoint_dir}")
-    print(f"  Epochs             : {args.epochs}")
-    print(f"  Batch size         : {args.batch_size}")
-    print(f"  Learning rate      : {args.learning_rate}")
-    print(f"  Num workers        : {args.num_workers}")
-    print(f"  Seed               : {args.seed}")
+    print(f"  Data dir              : {args.data_dir}")
+    print(f"  Checkpoint dir        : {args.checkpoint_dir}")
+    print(f"  Epochs                : {args.epochs}")
+    print(f"  Batch size            : {args.batch_size}")
+    print(f"  Learning rate         : {args.learning_rate}")
+    # FIXED: print early stopping patience
+    print(f"  Early stopping patience : {args.early_stopping_patience}")
+    print(f"  Num workers           : {args.num_workers}")
+    print(f"  Seed                  : {args.seed}")
     print(f"{'='*70}\n")
     
+    # FIXED: pass early_stopping_patience to train_hybrid_model if needed
+    # For now it's hardcoded as patience=15 in the function, but you can modify:
     train_hybrid_model(
         data_dir=args.data_dir,
         output_dir=args.checkpoint_dir,
         epochs=args.epochs,
         batch_size=args.batch_size,
-        lr=args.learning_rate
+        lr=args.learning_rate,
+        early_stopping_patience=args.early_stopping_patience  # FIXED: pass argument
     )
