@@ -4,7 +4,13 @@ Extracts hand-crafted features like cell size, shape, texture, etc.
 """
 import cv2
 import numpy as np
-from skimage.feature import graycomatrix, graycoprops
+# FIXED: Use graycomatrix (American spelling) instead of greycomatrix
+try:
+    from skimage.feature import graycomatrix, graycoprops
+except ImportError:
+    # Fallback for older versions
+    from skimage.feature import greycomatrix as graycomatrix, greycoprops
+
 from scipy import ndimage
 from pathlib import Path
 
@@ -72,8 +78,8 @@ class CellFeatureExtractor:
         # FIXED: #2 remove glcm_dissimilarity to keep 30 features (option A)
         # or add it to feature_order below (option B). Here using option A.
         
-        # Compute GLCM
-        glcm = greycomatrix(gray, distances=[1], angles=[0], levels=256, symmetric=True, normed=True)
+        # Compute GLCM - FIXED: use graycomatrix instead of greycomatrix
+        glcm = graycomatrix(gray, distances=[1], angles=[0], levels=256, symmetric=True, normed=True)
         glcm = glcm[:, :, 0, 0]
         
         # Extract 4 GLCM properties (not 5)
