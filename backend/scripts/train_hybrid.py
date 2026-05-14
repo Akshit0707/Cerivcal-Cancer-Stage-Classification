@@ -204,14 +204,21 @@ class EfficientNetHybrid(nn.Module):
         )
 
     def forward(self, images, features):
-        cnn_feat = self.backbone(images)
+        # Defensive: replace any NaN/Inf in inputs before forward pass
+        images   = torch.nan_to_num(images,   nan=0.0, posinf=1.0, neginf=-1.0)
+        features = torch.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+
+        cnn_feat  = self.backbone(images)
+        cnn_feat  = torch.nan_to_num(cnn_feat, nan=0.0, posinf=1e3, neginf=-1e3)
+
         trad_feat = self.feature_mlp(features)
+        trad_feat = torch.nan_to_num(trad_feat, nan=0.0, posinf=1e3, neginf=-1e3)
 
         fused = torch.cat([cnn_feat, trad_feat], dim=1)
-        attn = self.attention(fused)
+        attn  = self.attention(fused)
 
-        cnn_scaled  = cnn_feat  * attn[:, 0:1]
-        trad_scaled = trad_feat * attn[:, 1:2]
+        cnn_scaled   = cnn_feat  * attn[:, 0:1]
+        trad_scaled  = trad_feat * attn[:, 1:2]
         fused_scaled = torch.cat([cnn_scaled, trad_scaled], dim=1)
 
         logits = self.classifier(fused_scaled)
@@ -359,10 +366,23 @@ def train_epoch(model, train_loader, optimizer, criterion, device,
     correct = 0
     total = 0
 
+    first_batch = True
     for batch in tqdm(train_loader, desc="Training", leave=False):
         images   = batch['image'].to(device)
         features = batch['features'].to(device)
         labels   = batch['label'].to(device)
+
+        # First-batch diagnostics to catch data pipeline NaN early
+        if first_batch:
+            first_batch = False
+            if not torch.isfinite(images).all():
+                print(f"  ⚠️  DIAGNOSTIC: images contain NaN/Inf — check image normalisation")
+            if not torch.isfinite(features).all():
+                n_bad = (~torch.isfinite(features)).sum().item()
+                print(f"  ⚠️  DIAGNOSTIC: features contain {n_bad} NaN/Inf — check feature extraction / scaler")
+            else:
+                fmin, fmax = features.min().item(), features.max().item()
+                print(f"  ✅  DIAGNOSTIC: features OK — range [{fmin:.2f}, {fmax:.2f}]")
 
         use_mixup_now = use_mixup and (current_epoch >= mixup_start_epoch)
 
@@ -461,6 +481,8 @@ def build_feature_cache(image_paths, feature_scaler=None, fit_scaler=False):
     if fit_scaler:
         feature_scaler = StandardScaler()
         feature_scaler.fit([raw[p] for p in image_paths])
+        # FIX: replace zero-variance features with scale=1 to avoid division-by-zero NaN
+        feature_scaler.scale_ = np.where(feature_scaler.scale_ < 1e-8, 1.0, feature_scaler.scale_)
 
     cache = {}
     for p in image_paths:
@@ -589,10 +611,11 @@ def train_hybrid_model(data_dir, output_dir, epochs=100, batch_size=32,
 
     criterion = LabelSmoothingCrossEntropy(smoothing=0.05)
 
-    # FIX BUG 6: AMP GradScaler
-    use_amp = device.type == 'cuda'
-    scaler  = torch.cuda.amp.GradScaler(enabled=use_amp)
-    print(f"  AMP: {'Enabled' if use_amp else 'Disabled'}")
+    # AMP DISABLED: BatchNorm1d layers produce NaN in float16 during early training
+    # when batch statistics are near zero. The T4 speedup is not worth broken training.
+    use_amp = False
+    scaler  = None
+    print(f"  AMP: Disabled (BatchNorm1d + float16 = NaN risk)")
 
     # ── Training loop ──────────────────────────────────────────────────
     best_macro_f1   = 0.0
