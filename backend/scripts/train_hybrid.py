@@ -463,46 +463,118 @@ def train_hybrid_model(data_dir, output_dir, epochs=80, batch_size=16, lr=1e-3, 
     
     os.makedirs(output_dir, exist_ok=True)
     
-    # FIXED: Handle both .jpg and .png, add debug output
+    # FIXED: Handle both data structure types
     data_path = Path(data_dir)
     print(f"📁 Looking for images in: {data_path}")
     print(f"   Directory exists: {data_path.exists()}")
     
     if data_path.exists():
-        print(f"   Contents: {list(data_path.iterdir())[:5]}")
+        print(f"   Top-level contents: {[p.name for p in list(data_path.iterdir())[:10]]}")
     
-    # Load image paths and labels - FIXED: support both .jpg and .png
+    # Detect data structure
     class_names = ['Dysplasia', 'Koilocytosis', 'Metaplasia', 'Parabasal', 'Superficial']
     image_paths = []
     labels = []
     
-    for class_idx, class_name in enumerate(class_names):
-        class_dir = data_path / class_name
-        if not class_dir.exists():
-            print(f"⚠️  Warning: Class directory not found: {class_dir}")
-            continue
+    # FIXED: Try structure 1: /data/ClassName/*.jpg
+    has_class_dirs = all((data_path / cn).exists() for cn in class_names)
+    
+    if has_class_dirs:
+        print("✅ Detected structure: /data/ClassName/*.jpg")
+        for class_idx, class_name in enumerate(class_names):
+            class_dir = data_path / class_name
+            img_files = sorted(list(class_dir.glob('*.jpg')) + list(class_dir.glob('*.png')))
+            print(f"   {class_name}: {len(img_files)} images")
+            
+            for img_path in img_files:
+                image_paths.append(str(img_path))
+                labels.append(class_idx)
+    else:
+        # FIXED: Try structure 2: /data/train/ClassName/*.jpg or /data/train/*.jpg with metadata
+        print("✅ Detected structure: /data/train/ClassName/*.jpg or similar")
         
-        # FIXED: match both .jpg and .png files
-        img_files = sorted(list(class_dir.glob('*.jpg')) + list(class_dir.glob('*.png')))
-        print(f"   {class_name}: {len(img_files)} images")
-        
-        for img_path in img_files:
-            image_paths.append(str(img_path))
-            labels.append(class_idx)
+        # Check if train/val/test subdirs exist
+        split_dirs = ['train', 'val', 'test']
+        for split in split_dirs:
+            split_path = data_path / split
+            if not split_path.exists():
+                continue
+            
+            print(f"\n📂 Processing {split}/ directory:")
+            split_contents = list(split_path.iterdir())
+            print(f"   Contents: {[p.name for p in split_contents[:10]]}")
+            
+            # Check if classes are subdirs or all images are flat
+            has_class_subdirs = any((split_path / cn).exists() for cn in class_names)
+            
+            if has_class_subdirs:
+                # Structure: /train/ClassName/*.jpg
+                for class_idx, class_name in enumerate(class_names):
+                    class_dir = split_path / class_name
+                    if not class_dir.exists():
+                        continue
+                    img_files = sorted(list(class_dir.glob('*.jpg')) + list(class_dir.glob('*.png')))
+                    print(f"     {class_name}: {len(img_files)} images")
+                    
+                    for img_path in img_files:
+                        image_paths.append(str(img_path))
+                        labels.append(class_idx)
+            else:
+                # Structure: /train/*.jpg with class in filename or metadata
+                # FIXED: try to infer class from parent directory name
+                img_files = sorted(list(split_path.glob('**/*.jpg')) + list(split_path.glob('**/*.png')))
+                print(f"     Found {len(img_files)} flat images")
+                
+                for img_path in img_files:
+                    # Try to infer class from parent folder name
+                    parent_name = img_path.parent.name.lower()
+                    class_idx = None
+                    
+                    for idx, class_name in enumerate(class_names):
+                        if class_name.lower() in parent_name:
+                            class_idx = idx
+                            break
+                    
+                    if class_idx is not None:
+                        image_paths.append(str(img_path))
+                        labels.append(class_idx)
+                    else:
+                        # Last resort: use first parent as class indicator
+                        print(f"     ⚠️  Could not infer class for {img_path.name}, skipping")
     
     print(f"\n✅ Total images found: {len(image_paths)}")
     
     if len(image_paths) == 0:
+        print("\n❌ NO IMAGES FOUND!")
+        print(f"Expected one of:")
+        print(f"  1. /data/Dysplasia/*.jpg")
+        print(f"  2. /data/train/Dysplasia/*.jpg")
+        print(f"  3. /data/train/dysplasia_images/*.jpg")
+        print(f"\nActual structure at {data_path}:")
+        for item in sorted(data_path.rglob('*'))[:20]:
+            rel = item.relative_to(data_path)
+            if item.is_file() and item.suffix.lower() in ['.jpg', '.png']:
+                print(f"  {rel}")
+        
         raise ValueError(
             f"No images found in {data_dir}. "
-            f"Expected structure: {data_dir}/Dysplasia/*.jpg, etc."
+            f"Please check directory structure."
         )
+    
+    # Verify class distribution
+    from collections import Counter
+    dist = Counter(labels)
+    print(f"\nClass distribution:")
+    for class_idx, class_name in enumerate(class_names):
+        count = dist.get(class_idx, 0)
+        print(f"  {class_name}: {count}")
     
     # Train/val split
     train_paths, val_paths, train_labels, val_labels = train_test_split(
         image_paths, labels, test_size=0.2, random_state=42, stratify=labels
     )
     
+    print(f"\n📊 Split:")
     print(f"   Train: {len(train_paths)}, Val: {len(val_paths)}")
     
     # Image transforms
@@ -531,7 +603,7 @@ def train_hybrid_model(data_dir, output_dir, epochs=80, batch_size=16, lr=1e-3, 
     
     feature_extractor = CellFeatureExtractor()
     
-    print("Extracting training features...")
+    print("\n🔍 Extracting training features...")
     train_cache_raw = {}
     for img_path in tqdm(train_paths, desc="Train features"):
         try:
@@ -540,7 +612,7 @@ def train_hybrid_model(data_dir, output_dir, epochs=80, batch_size=16, lr=1e-3, 
             print(f"Warning: Failed to extract features for {img_path}: {e}")
             train_cache_raw[img_path] = np.zeros(NUM_TRADITIONAL_FEATURES)
     
-    print("Extracting validation features...")
+    print("🔍 Extracting validation features...")
     val_cache_raw = {}
     for img_path in tqdm(val_paths, desc="Val features"):
         try:
@@ -605,7 +677,7 @@ def train_hybrid_model(data_dir, output_dir, epochs=80, batch_size=16, lr=1e-3, 
     
     best_val_acc = 0
     best_macro_f1 = 0
-    patience = early_stopping_patience  # FIXED: use parameter instead of hardcoded
+    patience = early_stopping_patience
     patience_counter = 0
     checkpoint_path = os.path.join(output_dir, 'best_model.pt')
     history = {'train_loss': [], 'train_acc': [], 'val_acc': [], 'val_loss': [], 'val_macro_f1': []}
@@ -615,7 +687,6 @@ def train_hybrid_model(data_dir, output_dir, epochs=80, batch_size=16, lr=1e-3, 
         print(f"Epoch {epoch+1}/{epochs}")
         print(f"{'='*70}")
         
-        # FIXED: pass current_epoch to train_epoch for mixup gating
         train_loss, train_acc = train_epoch(
             model, train_loader, optimizer, scheduler, criterion, device, 
             use_mixup=True, start_mixup_epoch=15, current_epoch=epoch
