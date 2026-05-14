@@ -660,7 +660,7 @@ def train_hybrid_model(data_dir, output_dir, epochs=100, batch_size=32,
     model = build_model(num_classes=len(class_names),
                         num_features=NUM_TRADITIONAL_FEATURES,
                         device=device,
-                        dropout=0.5)  # higher dropout to fight synthetic overfitting
+                        dropout=0.4)
 
     # Differential LR: backbone gets 1/100 of head LR
     backbone_param_ids = {id(p) for p in model.backbone.parameters()}
@@ -668,8 +668,9 @@ def train_hybrid_model(data_dir, output_dir, epochs=100, batch_size=32,
     head_params     = [p for p in model.parameters() if id(p) not in backbone_param_ids]
 
     optimizer = torch.optim.AdamW([
-        {'params': backbone_params, 'lr': lr * 0.01,  'weight_decay': 1e-3},  # 1e-6, strong WD
-        {'params': head_params,     'lr': lr,          'weight_decay': 1e-4},  # 1e-4
+        # FIX: backbone at 50% of head LR — 1e-6 was too small to adapt ImageNet→microscopy
+        {'params': backbone_params, 'lr': lr * 0.5,   'weight_decay': 1e-4},  # 5e-5
+        {'params': head_params,     'lr': lr,           'weight_decay': 1e-4},  # 1e-4
     ])
 
     # Single scheduler: WarmupCosine only.
@@ -698,12 +699,13 @@ def train_hybrid_model(data_dir, output_dir, epochs=100, batch_size=32,
         print(f"Epoch {epoch+1}/{epochs}")
         print(f"{'='*70}")
 
-        # Start MixUp early if synthetic images dominate (best defense against memorization)
-        mixup_start = 0 if n_synthetic > n_real else 15
+        # Always delay MixUp until after warmup so the model learns clean
+        # class boundaries first — MixUp during warmup creates noise gradients
+        # before the head has any discriminative signal.
         train_loss, train_acc = train_epoch(
             model, train_loader, optimizer, criterion, device,
             scaler=scaler, use_mixup=True,
-            current_epoch=epoch, mixup_start_epoch=mixup_start
+            current_epoch=epoch, mixup_start_epoch=10
         )
 
         val_acc, val_loss, _, _, macro_f1 = evaluate(model, val_loader, device, criterion)
