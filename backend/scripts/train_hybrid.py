@@ -443,15 +443,16 @@ def build_feature_cache(image_paths, feature_scaler=None, fit_scaler=False):
     """
     Extract features for a list of image paths.
 
-    FIX BUG 5: The original code passed a PIL Image object to
-    extract_medical_features(), but the function expects a file path string.
-    This caused silent zero-vector fallbacks for every image.
+    The original code passed a path string to extract_medical_features(), but
+    the function validates its input and requires a PIL Image (raises
+    "Unsupported image type: <class 'str'>" otherwise).
+    Fix: open each image with PIL first, then pass the Image object.
     """
     raw = {}
     for img_path in tqdm(image_paths, desc="Extracting features", leave=False):
         try:
-            # FIX: pass path string, not PIL Image
-            feats = extract_medical_features(img_path)
+            img = Image.open(img_path).convert('RGB')
+            feats = extract_medical_features(img)
             raw[img_path] = feats
         except Exception as e:
             print(f"  ⚠️  Feature extraction failed for {Path(img_path).name}: {e}")
