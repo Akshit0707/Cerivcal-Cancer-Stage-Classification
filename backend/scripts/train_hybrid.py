@@ -522,15 +522,10 @@ def build_feature_cache(image_paths, feature_scaler=None, fit_scaler=False):
     """
     Extract, sanitize, scale and cache features for all image paths.
 
-    FIX BUG 5 (CRITICAL): The original code did:
-        img   = Image.open(img_path).convert('RGB')
-        feats = extract_medical_features(img)   ← PIL Image passed
-    But extract_medical_features(path) expects a FILE PATH string and
-    opens the image internally. Passing a PIL Image silently returned
-    zeros for every sample — the feature branch trained on pure noise.
-
-    This fix passes img_path (string) directly, removing the PIL open
-    entirely from this function (the Dataset handles PIL loading separately).
+    FIX BUG 5 (CRITICAL): extract_medical_features() expects a PIL Image object.
+    Confirmed from runtime error "Unsupported image type: <class 'str'>" when
+    a path string was passed. This function opens each image with PIL and passes
+    the Image object — which is what the extractor actually requires.
 
     FIX: Uses RobustScaler (percentile-based) to handle outliers better
     than StandardScaler, clipping to ±3 after scaling.
@@ -540,8 +535,9 @@ def build_feature_cache(image_paths, feature_scaler=None, fit_scaler=False):
 
     for img_path in tqdm(image_paths, desc="Extracting features", leave=False):
         try:
-            # FIX BUG 5: pass the path string, NOT a PIL Image object
-            feats = extract_medical_features(img_path)
+            # extract_medical_features expects a PIL Image object (confirmed from error output)
+            img   = Image.open(img_path).convert('RGB')
+            feats = extract_medical_features(img)
             feats = sanitize_features(feats)
 
             if len(feats) != NUM_TRADITIONAL_FEATURES:
