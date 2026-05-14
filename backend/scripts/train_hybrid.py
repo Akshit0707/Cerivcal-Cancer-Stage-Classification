@@ -463,119 +463,127 @@ def train_hybrid_model(data_dir, output_dir, epochs=80, batch_size=16, lr=1e-3, 
     
     os.makedirs(output_dir, exist_ok=True)
     
-    # FIXED: Handle both data structure types
+    # FIXED: Better data structure detection
     data_path = Path(data_dir)
     print(f"📁 Looking for images in: {data_path}")
     print(f"   Directory exists: {data_path.exists()}")
     
     if data_path.exists():
-        print(f"   Top-level contents: {[p.name for p in list(data_path.iterdir())[:10]]}")
+        contents = sorted([p.name for p in data_path.iterdir()])
+        print(f"   Top-level contents: {contents}")
     
-    # Detect data structure
+    # Class names to search for
     class_names = ['Dysplasia', 'Koilocytosis', 'Metaplasia', 'Parabasal', 'Superficial']
     image_paths = []
     labels = []
     
-    # FIXED: Try structure 1: /data/ClassName/*.jpg
+    # FIXED: Strategy 1 - Direct class folders at root
     has_class_dirs = all((data_path / cn).exists() for cn in class_names)
     
     if has_class_dirs:
-        print("✅ Detected structure: /data/ClassName/*.jpg")
+        print("✅ Detected: /data/ClassName/")
         for class_idx, class_name in enumerate(class_names):
             class_dir = data_path / class_name
-            img_files = sorted(list(class_dir.glob('*.jpg')) + list(class_dir.glob('*.png')))
+            img_files = sorted(list(class_dir.glob('*.jpg')) + list(class_dir.glob('*.JPG')) + 
+                             list(class_dir.glob('*.png')) + list(class_dir.glob('*.PNG')))
             print(f"   {class_name}: {len(img_files)} images")
             
             for img_path in img_files:
                 image_paths.append(str(img_path))
                 labels.append(class_idx)
     else:
-        # FIXED: Try structure 2: /data/train/ClassName/*.jpg or /data/train/*.jpg with metadata
-        print("✅ Detected structure: /data/train/ClassName/*.jpg or similar")
+        # FIXED: Strategy 2 - Check train/ folder first, then combine with val/
+        print("✅ Checking for train/val split structure...")
         
-        # Check if train/val/test subdirs exist
-        split_dirs = ['train', 'val', 'test']
+        split_dirs = ['train', 'val']
         for split in split_dirs:
             split_path = data_path / split
             if not split_path.exists():
+                print(f"   ⚠️  {split}/ not found, skipping")
                 continue
             
             print(f"\n📂 Processing {split}/ directory:")
-            split_contents = list(split_path.iterdir())
-            print(f"   Contents: {[p.name for p in split_contents[:10]]}")
             
-            # Check if classes are subdirs or all images are flat
-            has_class_subdirs = any((split_path / cn).exists() for cn in class_names)
+            # Check if class subdirs exist in split
+            split_has_classes = any((split_path / cn).exists() for cn in class_names)
             
-            if has_class_subdirs:
-                # Structure: /train/ClassName/*.jpg
+            if split_has_classes:
+                print(f"   Found class subdirectories in {split}/")
                 for class_idx, class_name in enumerate(class_names):
                     class_dir = split_path / class_name
                     if not class_dir.exists():
                         continue
-                    img_files = sorted(list(class_dir.glob('*.jpg')) + list(class_dir.glob('*.png')))
+                    
+                    img_files = sorted(list(class_dir.glob('*.jpg')) + list(class_dir.glob('*.JPG')) + 
+                                     list(class_dir.glob('*.png')) + list(class_dir.glob('*.PNG')))
                     print(f"     {class_name}: {len(img_files)} images")
                     
                     for img_path in img_files:
                         image_paths.append(str(img_path))
                         labels.append(class_idx)
             else:
-                # Structure: /train/*.jpg with class in filename or metadata
-                # FIXED: try to infer class from parent directory name
-                img_files = sorted(list(split_path.glob('**/*.jpg')) + list(split_path.glob('**/*.png')))
-                print(f"     Found {len(img_files)} flat images")
-                
-                for img_path in img_files:
-                    # Try to infer class from parent folder name
-                    parent_name = img_path.parent.name.lower()
-                    class_idx = None
+                # FIXED: Look for class folders at any depth
+                print(f"   Searching for class folders at any depth in {split}/...")
+                for class_idx, class_name in enumerate(class_names):
+                    # Look recursively for folders matching class name
+                    matching_dirs = list(split_path.glob(f'**/{class_name}')) + \
+                                   list(split_path.glob(f'**/{class_name.lower()}')) + \
+                                   list(split_path.glob(f'**/*{class_name}*'))
                     
-                    for idx, class_name in enumerate(class_names):
-                        if class_name.lower() in parent_name:
-                            class_idx = idx
+                    for class_dir in matching_dirs:
+                        if class_dir.is_dir():
+                            img_files = sorted(list(class_dir.glob('*.jpg')) + list(class_dir.glob('*.JPG')) + 
+                                             list(class_dir.glob('*.png')) + list(class_dir.glob('*.PNG')))
+                            if img_files:
+                                print(f"     Found {class_dir.name}: {len(img_files)} images")
+                                for img_path in img_files:
+                                    image_paths.append(str(img_path))
+                                    labels.append(class_idx)
                             break
-                    
-                    if class_idx is not None:
-                        image_paths.append(str(img_path))
-                        labels.append(class_idx)
-                    else:
-                        # Last resort: use first parent as class indicator
-                        print(f"     ⚠️  Could not infer class for {img_path.name}, skipping")
     
     print(f"\n✅ Total images found: {len(image_paths)}")
     
     if len(image_paths) == 0:
         print("\n❌ NO IMAGES FOUND!")
-        print(f"Expected one of:")
-        print(f"  1. /data/Dysplasia/*.jpg")
-        print(f"  2. /data/train/Dysplasia/*.jpg")
-        print(f"  3. /data/train/dysplasia_images/*.jpg")
-        print(f"\nActual structure at {data_path}:")
-        for item in sorted(data_path.rglob('*'))[:20]:
-            rel = item.relative_to(data_path)
-            if item.is_file() and item.suffix.lower() in ['.jpg', '.png']:
-                print(f"  {rel}")
+        print(f"\nSearched for classes: {class_names}")
+        print(f"\nActual directory structure:")
+        
+        # Show actual structure
+        for i, item in enumerate(sorted(data_path.rglob('*'))[:50]):
+            if item.is_dir():
+                level = len(item.relative_to(data_path).parts)
+                indent = "  " * level
+                print(f"{indent}📁 {item.name}/")
+            else:
+                if item.suffix.lower() in ['.jpg', '.png']:
+                    level = len(item.relative_to(data_path).parts)
+                    indent = "  " * level
+                    print(f"{indent}🖼️  {item.name}")
         
         raise ValueError(
             f"No images found in {data_dir}. "
-            f"Please check directory structure."
+            f"Expected class folders: {class_names}"
         )
     
     # Verify class distribution
-    from collections import Counter
     dist = Counter(labels)
     print(f"\nClass distribution:")
     for class_idx, class_name in enumerate(class_names):
         count = dist.get(class_idx, 0)
-        print(f"  {class_name}: {count}")
+        pct = 100 * count / len(labels) if labels else 0
+        print(f"  {class_name}: {count} ({pct:.1f}%)")
     
     # Train/val split
+    if len(image_paths) < 10:
+        raise ValueError(f"Not enough images ({len(image_paths)}) to train. Need at least 10.")
+    
     train_paths, val_paths, train_labels, val_labels = train_test_split(
         image_paths, labels, test_size=0.2, random_state=42, stratify=labels
     )
     
-    print(f"\n📊 Split:")
-    print(f"   Train: {len(train_paths)}, Val: {len(val_paths)}")
+    print(f"\n📊 Train/Val split:")
+    print(f"   Train: {len(train_paths)} images")
+    print(f"   Val:   {len(val_paths)} images")
     
     # Image transforms
     train_transform = transforms.Compose([
@@ -609,7 +617,7 @@ def train_hybrid_model(data_dir, output_dir, epochs=80, batch_size=16, lr=1e-3, 
         try:
             train_cache_raw[img_path] = extract_medical_features(img_path, feature_extractor)
         except Exception as e:
-            print(f"Warning: Failed to extract features for {img_path}: {e}")
+            print(f"Warning: Failed to extract features for {Path(img_path).name}: {e}")
             train_cache_raw[img_path] = np.zeros(NUM_TRADITIONAL_FEATURES)
     
     print("🔍 Extracting validation features...")
@@ -618,7 +626,7 @@ def train_hybrid_model(data_dir, output_dir, epochs=80, batch_size=16, lr=1e-3, 
         try:
             val_cache_raw[img_path] = extract_medical_features(img_path, feature_extractor)
         except Exception as e:
-            print(f"Warning: Failed to extract features for {img_path}: {e}")
+            print(f"Warning: Failed to extract features for {Path(img_path).name}: {e}")
             val_cache_raw[img_path] = np.zeros(NUM_TRADITIONAL_FEATURES)
     
     # Fit scaler on train features
@@ -626,7 +634,7 @@ def train_hybrid_model(data_dir, output_dir, epochs=80, batch_size=16, lr=1e-3, 
     feature_scaler = StandardScaler()
     feature_scaler.fit(train_features_list)
     
-    # FIXED: #1 scale val features and store in val_cache
+    # Scale val features
     val_cache = {}
     for p in val_paths:
         val_cache[p] = feature_scaler.transform([val_cache_raw[p]])[0]
@@ -640,14 +648,14 @@ def train_hybrid_model(data_dir, output_dir, epochs=80, batch_size=16, lr=1e-3, 
     train_ds = HybridDataset(
         train_paths, train_labels,
         transform=train_transform,
-        feature_extractor=None,  # FIXED: already cached
+        feature_extractor=None,
         feature_cache=scaled_train_cache
     )
     
     val_ds = HybridDataset(
         val_paths, val_labels,
         transform=val_transform,
-        feature_extractor=None,  # FIXED: already cached
+        feature_extractor=None,
         feature_cache=val_cache
     )
     
@@ -684,7 +692,7 @@ def train_hybrid_model(data_dir, output_dir, epochs=80, batch_size=16, lr=1e-3, 
     
     for epoch in range(epochs):
         print(f"\n{'='*70}")
-        print(f"Epoch {epoch+1}/{epochs}")
+        print(f"Epoch {epoch+1}/{epochs} | LR: {optimizer.param_groups[1]['lr']:.2e} (backbone: {optimizer.param_groups[0]['lr']:.2e})")
         print(f"{'='*70}")
         
         train_loss, train_acc = train_epoch(
@@ -700,8 +708,8 @@ def train_hybrid_model(data_dir, output_dir, epochs=80, batch_size=16, lr=1e-3, 
         history['val_loss'].append(val_loss)
         history['val_macro_f1'].append(macro_f1)
         
-        print(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%")
-        print(f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%, Macro-F1: {macro_f1:.4f}")
+        print(f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
+        print(f"Val Loss:   {val_loss:.4f} | Val Acc:   {val_acc:.2f}% | Macro-F1: {macro_f1:.4f}")
         
         if macro_f1 > best_macro_f1:
             best_macro_f1 = macro_f1
@@ -723,6 +731,7 @@ def train_hybrid_model(data_dir, output_dir, epochs=80, batch_size=16, lr=1e-3, 
     print(f"✅ Training complete!")
     print(f"   Best val acc: {best_val_acc:.2f}%")
     print(f"   Best macro-F1: {best_macro_f1:.4f}")
+    print(f"   Checkpoint: {checkpoint_path}")
     print(f"{'='*70}")
     return checkpoint_path
 
