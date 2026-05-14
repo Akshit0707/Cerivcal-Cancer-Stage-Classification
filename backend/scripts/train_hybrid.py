@@ -379,7 +379,10 @@ def train_epoch(model, train_loader, optimizer, criterion, device,
                 print(f"  ⚠️  DIAGNOSTIC: images contain NaN/Inf — check image normalisation")
             if not torch.isfinite(features).all():
                 n_bad = (~torch.isfinite(features)).sum().item()
-                print(f"  ⚠️  DIAGNOSTIC: features contain {n_bad} NaN/Inf — check feature extraction / scaler")
+                bad_dims = (~torch.isfinite(features)).any(dim=0).nonzero(as_tuple=True)[0].tolist()
+                print(f"  ⚠️  DIAGNOSTIC: features contain {n_bad} NaN/Inf values in dims {bad_dims[:10]}")
+                print(f"      feature min={features[torch.isfinite(features)].min():.3f}, "
+                      f"max={features[torch.isfinite(features)].max():.3f}")
             else:
                 fmin, fmax = features.min().item(), features.max().item()
                 print(f"  ✅  DIAGNOSTIC: features OK — range [{fmin:.2f}, {fmax:.2f}]")
@@ -459,35 +462,64 @@ def evaluate(model, val_loader, device, criterion=None):
 # ─────────────────────────────────────────────────────────────────────────────
 # Feature extraction helpers
 # ─────────────────────────────────────────────────────────────────────────────
+def sanitize_features(arr: np.ndarray) -> np.ndarray:
+    """Replace NaN/Inf in a feature vector with 0.0 and clip extreme values."""
+    arr = np.array(arr, dtype=np.float32)
+    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+    arr = np.clip(arr, -1e6, 1e6)
+    return arr
+
+
 def build_feature_cache(image_paths, feature_scaler=None, fit_scaler=False):
     """
-    Extract features for a list of image paths.
+    Extract, sanitize, scale and cache features for a list of image paths.
 
-    The original code passed a path string to extract_medical_features(), but
-    the function validates its input and requires a PIL Image (raises
-    "Unsupported image type: <class 'str'>" otherwise).
-    Fix: open each image with PIL first, then pass the Image object.
+    NaN chain: extract_medical_features() can return NaN (e.g. division by zero
+    in compactness = 4π·area/perimeter² when perimeter≈0). Those NaNs propagate
+    into StandardScaler.fit() → mean_ and scale_ become NaN → every transformed
+    sample is NaN → model loss is NaN.
+
+    Fix: sanitize every raw feature vector (nan→0, inf→0, clip) BEFORE fitting
+    the scaler and BEFORE storing in the cache.
     """
     raw = {}
+    n_bad = 0
     for img_path in tqdm(image_paths, desc="Extracting features", leave=False):
         try:
-            img = Image.open(img_path).convert('RGB')
+            img  = Image.open(img_path).convert('RGB')
             feats = extract_medical_features(img)
-            raw[img_path] = feats
+            feats = sanitize_features(feats)
         except Exception as e:
             print(f"  ⚠️  Feature extraction failed for {Path(img_path).name}: {e}")
-            raw[img_path] = np.zeros(NUM_TRADITIONAL_FEATURES)
+            feats = np.zeros(NUM_TRADITIONAL_FEATURES, dtype=np.float32)
+            n_bad += 1
+        raw[img_path] = feats
+
+    if n_bad:
+        print(f"  ⚠️  {n_bad}/{len(image_paths)} images used zero-vector fallback")
 
     if fit_scaler:
+        all_feats = np.stack([raw[p] for p in image_paths])  # (N, 30)
+        # Sanity-check: no NaN should survive sanitize_features
+        if np.isnan(all_feats).any():
+            print("  ⚠️  NaN in feature matrix after sanitization — forcing to 0")
+            all_feats = np.nan_to_num(all_feats, nan=0.0)
         feature_scaler = StandardScaler()
-        feature_scaler.fit([raw[p] for p in image_paths])
-        # FIX: replace zero-variance features with scale=1 to avoid division-by-zero NaN
-        feature_scaler.scale_ = np.where(feature_scaler.scale_ < 1e-8, 1.0, feature_scaler.scale_)
+        feature_scaler.fit(all_feats)
+        # Guard against zero-variance columns → scale_ = 0 → division by zero
+        feature_scaler.scale_ = np.where(
+            feature_scaler.scale_ < 1e-8, 1.0, feature_scaler.scale_
+        )
+        print(f"  ✅  Scaler fit: mean range [{feature_scaler.mean_.min():.3f}, "
+              f"{feature_scaler.mean_.max():.3f}], "
+              f"scale range [{feature_scaler.scale_.min():.3f}, {feature_scaler.scale_.max():.3f}]")
 
     cache = {}
     for p in image_paths:
         if feature_scaler is not None:
-            cache[p] = feature_scaler.transform([raw[p]])[0]
+            scaled = feature_scaler.transform([raw[p]])[0]
+            scaled = sanitize_features(scaled)  # sanitize again after scaling
+            cache[p] = scaled
         else:
             cache[p] = raw[p]
 
