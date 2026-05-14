@@ -577,9 +577,8 @@ def train_hybrid_model(data_dir, output_dir, epochs=80, batch_size=16, lr=1e-3):
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
     
     # Model
-    model = CPUOptimizedHybridModel(num_classes=5, num_traditional_features=30)  # FIXED: #2 will be 31
-    model = model.to(device)
-    
+    model = build_model(num_classes=5, num_features=NUM_TRADITIONAL_FEATURES, device=device)
+    # FIXED: changed from CPUOptimizedHybridModel to build_model() and EfficientNetHybrid
     # Optimizer with differential LR
     backbone_params = list(model.backbone.parameters())
     fusion_params = list(model.fusion.parameters()) + list(model.classifier.parameters())
@@ -641,10 +640,49 @@ def train_hybrid_model(data_dir, output_dir, epochs=80, batch_size=16, lr=1e-3):
 
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Train hybrid cervical cancer classifier')
+    parser.add_argument('--data-dir', type=str, default='/kaggle/working/data',
+                        help='Path to data directory')
+    parser.add_argument('--checkpoint-dir', type=str, default='./checkpoints',
+                        help='Directory to save checkpoints')
+    parser.add_argument('--epochs', type=int, default=100,
+                        help='Number of training epochs')
+    parser.add_argument('--batch-size', type=int, default=32,
+                        help='Batch size for training')
+    parser.add_argument('--learning-rate', type=float, default=0.0001,
+                        help='Learning rate')
+    parser.add_argument('--early-stopping-patience', type=int, default=20,
+                        help='Early stopping patience')
+    parser.add_argument('--num-workers', type=int, default=0,
+                        help='Number of workers for DataLoader')
+    parser.add_argument('--seed', type=int, default=42,
+                        help='Random seed')
+    
+    args = parser.parse_args()
+    
+    # FIXED: set seed from args
+    set_seed(args.seed)
+    
+    # FIXED: resolve data directory
+    data_dir = resolve_data_dir(args.data_dir)
+    
+    print(f"\n{'='*70}")
+    print(f"🚀 TRAINING CONFIGURATION")
+    print(f"{'='*70}")
+    print(f"  Data dir           : {data_dir}")
+    print(f"  Checkpoint dir     : {args.checkpoint_dir}")
+    print(f"  Epochs             : {args.epochs}")
+    print(f"  Batch size         : {args.batch_size}")
+    print(f"  Learning rate      : {args.learning_rate}")
+    print(f"  Early stopping     : {args.early_stopping_patience} epochs")
+    print(f"  Num workers        : {args.num_workers}")
+    print(f"  Seed               : {args.seed}")
+    print(f"{'='*70}\n")
+    
     train_hybrid_model(
-        data_dir='/path/to/data',
-        output_dir='./checkpoints',
-        epochs=80,
-        batch_size=16,
-        lr=1e-3
+        data_dir=str(data_dir),
+        output_dir=args.checkpoint_dir,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        lr=args.learning_rate
     )
