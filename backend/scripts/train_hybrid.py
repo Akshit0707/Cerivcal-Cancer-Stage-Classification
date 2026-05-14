@@ -611,19 +611,23 @@ def train_hybrid_model(data_dir, output_dir, epochs=80, batch_size=16, lr=1e-3, 
     train_cache_raw = {}
     for img_path in tqdm(train_paths, desc="Train features"):
         try:
-            train_cache_raw[img_path] = extract_medical_features(img_path, feature_extractor)
+            # FIXED: Read image first, then pass to extract_medical_features
+            img = Image.open(img_path)
+            train_cache_raw[img_path] = extract_medical_features(img)
         except Exception as e:
             print(f"Warning: Failed to extract features for {Path(img_path).name}: {e}")
-            train_cache_raw[img_path] = np.zeros(NUM_TRADITIONAL_FEATURES)
+            train_cache_raw[img_path] = np.zeros(30)
     
     print("🔍 Extracting validation features...")
     val_cache_raw = {}
     for img_path in tqdm(val_paths, desc="Val features"):
         try:
-            val_cache_raw[img_path] = extract_medical_features(img_path, feature_extractor)
+            # FIXED: Read image first, then pass to extract_medical_features
+            img = Image.open(img_path)
+            val_cache_raw[img_path] = extract_medical_features(img)
         except Exception as e:
             print(f"Warning: Failed to extract features for {Path(img_path).name}: {e}")
-            val_cache_raw[img_path] = np.zeros(NUM_TRADITIONAL_FEATURES)
+            val_cache_raw[img_path] = np.zeros(30)
     
     # Fit scaler on train features
     train_features_list = [train_cache_raw[p] for p in train_paths]
