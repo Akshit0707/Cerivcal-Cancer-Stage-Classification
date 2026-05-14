@@ -244,8 +244,24 @@ def build_model(num_classes, num_features, device, dropout=0.4):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Loss — FIX BUG 1b: clamp logits before log_softmax to prevent -inf
+# Loss Functions
 # ─────────────────────────────────────────────────────────────────────────────
+class FocalLoss(nn.Module):
+    """Focal Loss for handling class imbalance better than standard CrossEntropy."""
+    def __init__(self, alpha=0.25, gamma=2.0):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+
+    def forward(self, logits, targets):
+        # FIX: clamp logits to prevent numerical explosion
+        logits = torch.clamp(logits, -50.0, 50.0)
+        ce_loss = F.cross_entropy(logits, targets, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
+        return focal_loss.mean()
+
+
 class LabelSmoothingCrossEntropy(nn.Module):
     def __init__(self, smoothing: float = 0.05):
         super().__init__()
