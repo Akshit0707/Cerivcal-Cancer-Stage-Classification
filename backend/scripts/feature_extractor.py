@@ -4,7 +4,7 @@ Extracts hand-crafted features like cell size, shape, texture, etc.
 """
 import cv2
 import numpy as np
-from skimage.feature import greycomatrix, greycoprops
+from skimage.feature import graycomatrix, graycoprops
 from scipy import ndimage
 from pathlib import Path
 
