@@ -225,8 +225,8 @@ class EfficientNetHybrid(nn.Module):
         return logits, attn
 
 
-def build_model(num_classes, num_features, device):
-    model = EfficientNetHybrid(num_classes=num_classes, num_features=num_features)
+def build_model(num_classes, num_features, device, dropout=0.4):
+    model = EfficientNetHybrid(num_classes=num_classes, num_features=num_features, dropout=dropout)
     model = model.to(device)
     n_params  = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -612,16 +612,26 @@ def train_hybrid_model(data_dir, output_dir, epochs=100, batch_size=32,
     print("🔍 Extracting val features (apply scaler)...")
     val_cache, _ = build_feature_cache(val_paths, feature_scaler=feature_scaler)
 
+    # ── Separate real vs synthetic images in train set ───────────────────
+    n_synthetic = sum(1 for p in train_paths if 'synthetic' in p.lower())
+    n_real      = len(train_paths) - n_synthetic
+    print(f"\n📊 Train composition: {n_real} real  +  {n_synthetic} synthetic")
+    if n_synthetic > n_real:
+        print(f"  ⚠️  More synthetic than real — overfitting risk HIGH. Using stronger regularization.")
+
     # ── Transforms ───────────────────────────────────────────────────────
     train_transform = transforms.Compose([
         transforms.RandomHorizontalFlip(p=0.5),
-        transforms.RandomVerticalFlip(p=0.3),
-        transforms.RandomRotation(20),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1),
+        transforms.RandomVerticalFlip(p=0.5),
+        transforms.RandomRotation(30),
+        transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1),
+        transforms.RandomAffine(degrees=0, translate=(0.1, 0.1), scale=(0.85, 1.15)),
+        transforms.RandomGrayscale(p=0.05),
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
                              std=[0.229, 0.224, 0.225]),
+        transforms.RandomErasing(p=0.2, scale=(0.02, 0.1)),
     ])
     val_transform = transforms.Compose([
         transforms.Resize((224, 224)),
@@ -649,7 +659,8 @@ def train_hybrid_model(data_dir, output_dir, epochs=100, batch_size=32,
     # ── Model ─────────────────────────────────────────────────────────────
     model = build_model(num_classes=len(class_names),
                         num_features=NUM_TRADITIONAL_FEATURES,
-                        device=device)
+                        device=device,
+                        dropout=0.5)  # higher dropout to fight synthetic overfitting
 
     # Differential LR: backbone gets 1/100 of head LR
     backbone_param_ids = {id(p) for p in model.backbone.parameters()}
@@ -657,7 +668,7 @@ def train_hybrid_model(data_dir, output_dir, epochs=100, batch_size=32,
     head_params     = [p for p in model.parameters() if id(p) not in backbone_param_ids]
 
     optimizer = torch.optim.AdamW([
-        {'params': backbone_params, 'lr': lr * 0.05,  'weight_decay': 1e-4},  # 5e-6
+        {'params': backbone_params, 'lr': lr * 0.01,  'weight_decay': 1e-3},  # 1e-6, strong WD
         {'params': head_params,     'lr': lr,          'weight_decay': 1e-4},  # 1e-4
     ])
 
@@ -687,10 +698,12 @@ def train_hybrid_model(data_dir, output_dir, epochs=100, batch_size=32,
         print(f"Epoch {epoch+1}/{epochs}")
         print(f"{'='*70}")
 
+        # Start MixUp early if synthetic images dominate (best defense against memorization)
+        mixup_start = 0 if n_synthetic > n_real else 15
         train_loss, train_acc = train_epoch(
             model, train_loader, optimizer, criterion, device,
             scaler=scaler, use_mixup=True,
-            current_epoch=epoch, mixup_start_epoch=15
+            current_epoch=epoch, mixup_start_epoch=mixup_start
         )
 
         val_acc, val_loss, _, _, macro_f1 = evaluate(model, val_loader, device, criterion)
