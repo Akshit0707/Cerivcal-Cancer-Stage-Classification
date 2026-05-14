@@ -218,10 +218,18 @@ class EfficientNetHybrid(nn.Module):
             p.requires_grad = not freeze
 
     def forward(self, images, features):
+        # FIXED: validate and clip inputs to prevent NaN propagation
+        images = torch.clamp(images, -1e5, 1e5)
+        features = torch.clamp(features, -1e5, 1e5)
+        
         cnn_feat  = self.backbone(images)
+        cnn_feat = torch.clamp(cnn_feat, -1e3, 1e3)  # Clip backbone output
+        
         trad_feat = self.feature_mlp(features)
+        trad_feat = torch.clamp(trad_feat, -1e3, 1e3)  # Clip MLP output
 
         fused = torch.cat([cnn_feat, trad_feat], dim=1)
+        fused = torch.clamp(fused, -1e3, 1e3)
 
         attn = self.attention(fused)
         cnn_scaled  = cnn_feat  * attn[:, 0:1]
@@ -265,7 +273,10 @@ class LabelSmoothingCrossEntropy(nn.Module):
         with torch.no_grad():
             smooth_targets = torch.full_like(log_probs, self.smoothing / (n_classes - 1))
             smooth_targets.scatter_(1, targets.unsqueeze(1), 1.0 - self.smoothing)
-        return -(smooth_targets * log_probs).sum(dim=-1).mean()
+        # FIXED: add numerical stability with clamp
+        loss = -(smooth_targets * log_probs).sum(dim=-1)
+        loss = torch.clamp(loss, min=1e-7)  # Prevent log(0) = -inf
+        return loss.mean()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -678,8 +689,8 @@ def train_hybrid_model(data_dir, output_dir, epochs=80, batch_size=16, lr=1e-3, 
     other_params = [p for p in model.parameters() if id(p) not in backbone_param_ids]
     
     optimizer = torch.optim.AdamW([
-        {'params': backbone_params, 'lr': lr * 0.05, 'lr_scale': 0.05},
-        {'params': other_params, 'lr': lr, 'lr_scale': 1.0}
+        {'params': backbone_params, 'lr': lr * 0.01, 'lr_scale': 0.01},  # FIXED: reduced from 0.05
+        {'params': other_params, 'lr': lr * 0.1, 'lr_scale': 0.1}  # FIXED: reduced from 1.0
     ])
     
     scheduler = WarmupCosineScheduler(optimizer, warmup_epochs=3, total_epochs=epochs, base_lr=lr)
