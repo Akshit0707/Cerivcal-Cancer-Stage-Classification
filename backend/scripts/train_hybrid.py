@@ -681,13 +681,21 @@ def train_hybrid_model(data_dir, output_dir, epochs=100, batch_size=32,
     head_params     = [p for p in model.parameters() if id(p) not in backbone_param_ids]
 
     optimizer = torch.optim.AdamW([
-        {'params': backbone_params, 'lr': lr * 0.05,   'weight_decay': 1e-4},  # FIX: 0.05 instead of 0.1
-        {'params': head_params,     'lr': lr * 0.5,     'weight_decay': 1e-4},  # FIX: 0.5 instead of 1.0
+        {'params': backbone_params, 'lr': lr * 0.1,    'weight_decay': 1e-4},  # FIX: 0.1 instead of 0.05
+        {'params': head_params,     'lr': lr,           'weight_decay': 1e-4},  # FIX: 1.0 instead of 0.5
     ])
 
-    scheduler = WarmupCosineScheduler(optimizer, warmup_epochs=15, total_epochs=epochs)  # FIX: longer warmup
+    scheduler = WarmupCosineScheduler(optimizer, warmup_epochs=5, total_epochs=epochs)  # FIX: shorter warmup
 
-    criterion = FocalLoss(alpha=0.25, gamma=2.0)
+    criterion = FocalLoss(alpha=1.0, gamma=1.5)  # FIX: reduced gamma from 2.0 to 1.5, alpha=1.0
+
+    # FIX: INCREASE learning rate significantly
+    optimizer = torch.optim.AdamW([
+        {'params': backbone_params, 'lr': lr * 0.1,    'weight_decay': 1e-4},  # FIX: 0.1 instead of 0.05
+        {'params': head_params,     'lr': lr,           'weight_decay': 1e-4},  # FIX: 1.0 instead of 0.5
+    ])
+
+    scheduler = WarmupCosineScheduler(optimizer, warmup_epochs=5, total_epochs=epochs)  # FIX: shorter warmup
 
     # AMP DISABLED: BatchNorm1d layers produce NaN in float16 during early training
     # when batch statistics are near zero. The T4 speedup is not worth broken training.
