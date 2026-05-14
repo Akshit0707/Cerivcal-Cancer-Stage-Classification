@@ -585,7 +585,7 @@ def train_hybrid_model(data_dir, output_dir, epochs=100, batch_size=32,
 
     # Plateau scheduler as safety net
     plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', factor=0.5, patience=7, verbose=True)
+        optimizer, mode='max', factor=0.5, patience=7)
 
     criterion = LabelSmoothingCrossEntropy(smoothing=0.05)
 
@@ -617,7 +617,11 @@ def train_hybrid_model(data_dir, output_dir, epochs=100, batch_size=32,
 
         # FIX BUG 2: step schedulers ONCE per epoch here, not inside train_epoch
         scheduler.step()
+        prev_lr = optimizer.param_groups[1]['lr']
         plateau_scheduler.step(macro_f1)
+        new_lr = optimizer.param_groups[1]['lr']
+        if new_lr < prev_lr:
+            print(f"  📉 ReduceLROnPlateau: head LR {prev_lr:.2e} → {new_lr:.2e}")
 
         history['train_loss'].append(train_loss)
         history['train_acc'].append(train_acc)
