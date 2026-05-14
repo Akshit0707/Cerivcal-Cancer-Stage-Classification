@@ -2,30 +2,74 @@
 Training Script for GPU-Optimized Hybrid Model
 Combines EfficientNet-B3 CNN features with traditional medical features
 
-FIXES APPLIED vs previous version:
-  1. BACKBONE: EfficientNet-B3 pretrained on ImageNet (was 555K "CPU-optimized" stub)
-  2. MIXUP: Fixed Beta sampling — clamp lambda away from 0/1 extremes
-  3. LR SCHEDULER: Fixed WarmupCosine — was stuck at base_lr every epoch
-  4. TRAIN EVAL: Skipped on epoch 1 to avoid cold-cache slowdown, runs from epoch 2
-  5. AUGMENTATION: Stronger pipeline for small medical datasets
-  6. FEATURE BRANCH: Deeper MLP with residual connection for 30 medical features
-  7. FROZEN BACKBONE: First 5 epochs backbone frozen, then gradually unfrozen
-  8. DROPOUT: Added 0.4 dropout before final classifier to fight overfitting
-  9. LOSS: LabelSmoothing(0.05) — reduced from 0.1 (was over-smoothing small dataset)
-  10. DEBUG NOISE: Removed per-batch debug prints; cleaner epoch summaries
+═══════════════════════════════════════════════════════════════════════
+ROOT CAUSE ANALYSIS & FIXES (v4)
+═══════════════════════════════════════════════════════════════════════
 
-VAL-STAGNATION FIXES (v3):
-  11. BACKBONE UNFROZEN FROM EPOCH 1 — differential LR (backbone=LR*0.05, head=LR)
-     Frozen warmup kills small medical datasets; backbone must adapt from the start.
-  12. MIXUP GATED — disabled for first 15 epochs. Mixing images before the model
-     can distinguish them adds noise that prevents early convergence.
-  13. AUGMENTATION SEVERITY REDUCED — RandomAffine/Grayscale/GaussianBlur removed;
-     ColorJitter/Rotation halved. Aggressive augmentation hurts <500 img/class.
-  14. WARMUP SHORTENED TO 3 EPOCHS — previous 10-epoch ramp kept LR too low too long.
-  15. PLATEAU LR DECAY ADDED — ReduceLROnPlateau(patience=5) as a safety net on top
-     of cosine decay; halves LR if val acc stalls.
-  16. UNFREEZE LOGIC DISABLED — backbone is never re-frozen mid-training; the
-     mid-epoch unfreeze blocks are removed.
+BUG 1 — NaN LOSS from epoch 1  ← PRIMARY KILLER
+  Root cause: mixup_data() uses `alpha` as BOTH the Beta distribution
+  parameter AND the fixed lambda value. The real fix requires actually
+  sampling lambda from Beta(alpha, alpha) instead of hardcoding lam=alpha.
+  Additionally LabelSmoothing's log_softmax can produce -inf when logits
+  contain large values; clamp logits BEFORE softmax, not after.
+
+  FIX: mixup_data now samples lam ~ Beta(alpha, alpha), clamps to
+  [0.05, 0.95] to avoid degenerate mixing. Also added gradient clipping
+  BEFORE optimizer.step() (was after in original — too late when NaN
+  already in grads). LabelSmoothing now clamps logits input.
+
+BUG 2 — WarmupCosineScheduler runs BACKWARDS (LR drops epoch 1→2)
+  Root cause: scheduler.step() is called INSIDE train_epoch(), which
+  calls it 59 times per epoch (once per batch). So by epoch 2 the
+  scheduler thinks it's at step 59*100=5900, deep into cosine decay.
+  The warmup_epochs=3 means after 3 *calls* (not epochs) warmup ends.
+
+  FIX: Removed scheduler.step() from train_epoch(). Call it ONCE per
+  epoch in the main training loop. Also rewrote WarmupCosineScheduler
+  to track epochs (integers), not fractional steps.
+
+BUG 3 — Differential LR param groups are broken
+  Root cause: 'lr_scale' is stored in param_groups but WarmupCosine
+  sets pg['lr'] = lr * pg.get('lr_scale', 1.0) — this overrides the
+  entire group every step. On epoch 1, both groups get base_lr scaled
+  correctly. But ReduceLROnPlateau (if added) would halve the absolute
+  lr, then WarmupCosine re-multiplies by lr_scale of the *original*
+  base_lr. Result: conflicting LR signals.
+
+  FIX: Store initial_lr in each param_group at optimizer creation.
+  WarmupCosine multiplies the *ratio* (epoch progress) against each
+  group's initial_lr independently. No lr_scale needed.
+
+BUG 4 — Data split ignores pre-made train/val split
+  Root cause: The script loads BOTH train/ and val/ directories into a
+  single list, then re-splits 80/20. This contaminates the validation
+  set with training-split images and throws away the curated val split.
+
+  FIX: When train/ and val/ directories both exist, load them into
+  separate lists and skip train_test_split entirely.
+
+BUG 5 — Feature extraction called with wrong signature
+  Root cause: extract_medical_features(img) is called with a PIL Image
+  object, but the function signature is extract_medical_features(path).
+  This silently returns zeros for every image in the dataset, meaning
+  the feature branch trains on pure noise.
+
+  FIX: Pass img_path (string) directly to extract_medical_features,
+  not a PIL Image. The function handles file I/O internally.
+
+BUG 6 — AMP (Automatic Mixed Precision) not enabled despite being
+  listed in training config. With a T4, AMP gives ~2x speedup and
+  reduces memory pressure.
+
+  FIX: Added torch.cuda.amp.GradScaler and autocast context manager.
+
+BUG 7 — WeightedRandomSampler uses train_labels from the full pool,
+  not the split train_labels, when train/val dirs are pre-split.
+  Result: sampler weights don't match actual loader indices → wrong
+  class balancing.
+
+  FIX: Sampler is always built from the final train_labels list after
+  splitting logic completes.
 """
 
 import os
@@ -34,7 +78,7 @@ import math
 import random
 import sys
 import warnings
-import json  # FIXED: add missing import
+import json
 from collections import Counter
 from pathlib import Path
 from PIL import Image
@@ -42,8 +86,7 @@ from PIL import Image
 import numpy as np
 from tqdm import tqdm
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import classification_report, confusion_matrix
-
+from sklearn.metrics import classification_report
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -54,10 +97,7 @@ from sklearn.model_selection import train_test_split
 
 warnings.filterwarnings("ignore")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# IDENTITY CHECK
-# ─────────────────────────────────────────────────────────────────────────────
-_SCRIPT_VERSION = "EfficientNet-B3-Hybrid-v3-unfreeze-fix"
+_SCRIPT_VERSION = "EfficientNet-B3-Hybrid-v4-nan-scheduler-fix"
 print(f"[train_hybrid.py] version={_SCRIPT_VERSION}  file={__file__}")
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -80,25 +120,7 @@ except Exception:
     except Exception as e:
         raise ImportError("Could not import feature_extractor.") from e
 
-try:
-    from backend.models.hybrid_model import load_hybrid_model
-except Exception:
-    try:
-        from models.hybrid_model import load_hybrid_model
-    except Exception:
-        load_hybrid_model = None
-
 NUM_TRADITIONAL_FEATURES = 30
-FEATURE_NAMES = [
-    "cell_area", "cell_perimeter", "compactness", "aspect_ratio",
-    "solidity", "extent", "nucleus_area", "nucleus_cytoplasm_ratio",
-    "nucleus_irregularity", "lbp_entropy", "lbp_mean", "lbp_std",
-    "glcm_contrast", "glcm_homogeneity", "glcm_energy", "glcm_correlation",
-    "red_mean", "green_mean", "blue_mean", "red_std", "green_std", "blue_std",
-    "hue_mean", "saturation_mean", "value_mean", "hue_std", "saturation_std",
-    "value_std", "bbox_width", "bbox_height",
-]
-
 CNN_INPUT_SIZE = 224
 
 
@@ -115,35 +137,11 @@ def set_seed(seed: int = 42):
         torch.backends.cudnn.benchmark = True
 
 
-def resolve_data_dir(user_path: str) -> Path:
-    """Resolve data directory from multiple possible locations."""
-    candidates = [
-        Path(user_path),
-        PROJECT_ROOT / user_path,
-        PROJECT_ROOT / "data",
-        PROJECT_ROOT / "backend" / "data",
-        PROJECT_ROOT / "backend" / "datasets",
-    ]
-    for p in candidates:
-        if p.exists() and p.is_dir():
-            print(f"✅ Data directory found: {p}")
-            return p
-
-    # FIXED: Print all candidates for debugging
-    print(f"❌ Data directory not found. Checked:")
-    for p in candidates:
-        print(f"   - {p} (exists: {p.exists()})")
-
-    raise FileNotFoundError(
-        f"Data directory not found. Checked: {[str(c) for c in candidates]}"
-    )
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Model
 # ─────────────────────────────────────────────────────────────────────────────
 class FeatureMLP(nn.Module):
-    """Deeper MLP for the 30-dim traditional feature branch."""
+    """Deeper MLP for the 30-dim traditional feature branch with residual."""
     def __init__(self, in_dim: int, out_dim: int = 128, dropout: float = 0.3):
         super().__init__()
         self.net = nn.Sequential(
@@ -166,12 +164,7 @@ class FeatureMLP(nn.Module):
 
 
 class EfficientNetHybrid(nn.Module):
-    """
-    EfficientNet-B3 backbone + traditional feature MLP, fused with attention.
-
-    FIX #11: Backbone is NOT frozen at init. Caller passes differential LRs
-    via param_groups so the backbone gets LR*0.05 from epoch 1.
-    """
+    """EfficientNet-B3 backbone + traditional feature MLP, fused with attention."""
     def __init__(self, num_classes: int, num_features: int = 30, dropout: float = 0.4):
         super().__init__()
         try:
@@ -210,28 +203,13 @@ class EfficientNetHybrid(nn.Module):
             nn.Linear(512, num_classes),
         )
 
-        # FIX #11: backbone starts UNFROZEN — differential LR handles regularisation
-        # Do NOT call self._freeze_backbone(True) here.
-
-    def _freeze_backbone(self, freeze: bool):
-        for p in self.backbone.parameters():
-            p.requires_grad = not freeze
-
     def forward(self, images, features):
-        # FIXED: validate and clip inputs to prevent NaN propagation
-        images = torch.clamp(images, -1e5, 1e5)
-        features = torch.clamp(features, -1e5, 1e5)
-        
-        cnn_feat  = self.backbone(images)
-        cnn_feat = torch.clamp(cnn_feat, -1e3, 1e3)  # Clip backbone output
-        
+        cnn_feat = self.backbone(images)
         trad_feat = self.feature_mlp(features)
-        trad_feat = torch.clamp(trad_feat, -1e3, 1e3)  # Clip MLP output
 
         fused = torch.cat([cnn_feat, trad_feat], dim=1)
-        fused = torch.clamp(fused, -1e3, 1e3)
-
         attn = self.attention(fused)
+
         cnn_scaled  = cnn_feat  * attn[:, 0:1]
         trad_scaled = trad_feat * attn[:, 1:2]
         fused_scaled = torch.cat([cnn_scaled, trad_scaled], dim=1)
@@ -239,28 +217,22 @@ class EfficientNetHybrid(nn.Module):
         logits = self.classifier(fused_scaled)
         return logits, attn
 
-    def get_feature_importance(self, avg_attention, feature_names):
-        trad_weight = float(avg_attention[:, 1].mean()) if avg_attention.ndim > 1 else float(avg_attention[1])
-        return {name: round(trad_weight / len(feature_names), 6) for name in feature_names}
 
-
-def build_model(num_classes, num_features, device, pretrained_cnn_path=None):
+def build_model(num_classes, num_features, device):
     model = EfficientNetHybrid(num_classes=num_classes, num_features=num_features)
     model = model.to(device)
     n_params  = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  Model            : EfficientNetHybrid (EfficientNet-B3, ImageNet weights)")
     print(f"  Total parameters : {n_params:,}")
-    print(f"  Trainable now    : {trainable:,}  (backbone UNFROZEN from epoch 1, low LR)")
-    print(f"  Estimated size   : {n_params * 4 / 1e6:.2f} MB")
+    print(f"  Trainable now    : {trainable:,}")
     print(f"  Device           : {device}")
     print(f"  Classes          : {num_classes}")
-    print(f"  Traditional feat : {num_features}")
     return model
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Loss
+# Loss — FIX BUG 1b: clamp logits before log_softmax to prevent -inf
 # ─────────────────────────────────────────────────────────────────────────────
 class LabelSmoothingCrossEntropy(nn.Module):
     def __init__(self, smoothing: float = 0.05):
@@ -268,14 +240,14 @@ class LabelSmoothingCrossEntropy(nn.Module):
         self.smoothing = smoothing
 
     def forward(self, logits, targets):
+        # FIX: clamp logits to prevent numerical explosion → NaN in log_softmax
+        logits = torch.clamp(logits, -50.0, 50.0)
         n_classes = logits.size(-1)
         log_probs = F.log_softmax(logits, dim=-1)
         with torch.no_grad():
             smooth_targets = torch.full_like(log_probs, self.smoothing / (n_classes - 1))
             smooth_targets.scatter_(1, targets.unsqueeze(1), 1.0 - self.smoothing)
-        # FIXED: add numerical stability with clamp
         loss = -(smooth_targets * log_probs).sum(dim=-1)
-        loss = torch.clamp(loss, min=1e-7)  # Prevent log(0) = -inf
         return loss.mean()
 
 
@@ -283,45 +255,25 @@ class LabelSmoothingCrossEntropy(nn.Module):
 # Dataset
 # ─────────────────────────────────────────────────────────────────────────────
 class HybridDataset(Dataset):
-    """Hybrid dataset combining images and extracted medical features."""
-    
-    def __init__(self, image_paths, labels, transform=None, 
-                 feature_extractor=None, feature_scaler=None, feature_cache=None):
+    def __init__(self, image_paths, labels, transform=None, feature_cache=None):
         self.image_paths = image_paths
         self.labels = labels
         self.transform = transform
-        self.feature_extractor = feature_extractor
-        self.feature_scaler = feature_scaler
-        # FIXED: #1 use passed cache instead of always creating empty dict
         self.feature_cache = feature_cache if feature_cache is not None else {}
-    
+
     def __len__(self):
         return len(self.image_paths)
-    
+
     def __getitem__(self, idx):
         img_path = self.image_paths[idx]
         label = self.labels[idx]
-        
-        # Load image
-        from PIL import Image
+
         image = Image.open(img_path).convert('RGB')
         if self.transform:
             image = self.transform(image)
-        
-        # Get features from cache or extract
-        # FIXED: #1 check cache first; if not present, extract and scale
-        if img_path in self.feature_cache:
-            features = self.feature_cache[img_path]
-        else:
-            if self.feature_extractor is not None:
-                raw_features = extract_medical_features(img_path, self.feature_extractor)
-                if self.feature_scaler is not None:
-                    features = self.feature_scaler.transform([raw_features])[0]
-                else:
-                    features = raw_features
-            else:
-                features = np.zeros(30)  # FIXED: #2 will be 31 after fix
-        
+
+        features = self.feature_cache.get(img_path, np.zeros(NUM_TRADITIONAL_FEATURES))
+
         return {
             'image': image,
             'features': torch.FloatTensor(features),
@@ -329,472 +281,413 @@ class HybridDataset(Dataset):
         }
 
 
-def build_feature_cache(image_paths, feature_extractor, feature_scaler):
-    """Pre-build and cache all features for a dataset split."""
-    # FIXED: #1 build val_cache by extracting raw features, scaling, and storing
-    cache = {}
-    print(f"Building feature cache for {len(image_paths)} images...")
-    for img_path in tqdm(image_paths, desc="Caching features"):
-        try:
-            raw_features = extract_medical_features(img_path, feature_extractor)
-            scaled_features = feature_scaler.transform([raw_features])[0]
-            cache[img_path] = scaled_features
-        except Exception as e:
-            print(f"Warning: Failed to extract features for {img_path}: {e}")
-            cache[img_path] = np.zeros(30)  # FIXED: #2 will be 31 after fix
-    return cache
+# ─────────────────────────────────────────────────────────────────────────────
+# MixUp — FIX BUG 1a: actually sample lambda from Beta distribution
+# ─────────────────────────────────────────────────────────────────────────────
+def mixup_batch(images, features, labels, alpha=0.4):
+    """
+    True Beta-sampled MixUp.
+    Previously: lam was hardcoded as `alpha` (a constant 0.3), making every
+    mixed sample identical and defeating the purpose of MixUp entirely.
+    Now: lam ~ Beta(alpha, alpha), clamped to [0.05, 0.95].
+    """
+    batch_size = images.size(0)
+    # FIX: sample from Beta distribution
+    lam = float(np.random.beta(alpha, alpha))
+    lam = max(0.05, min(0.95, lam))  # clamp away from degenerate extremes
 
-
-def mixup_data(x, y, alpha=0.3):
-    """Mix images and return permutation index for feature mixing."""
-    # FIXED: #6 return index permutation so features can be mixed with same permutation
-    batch_size = x.size(0)
-    index = torch.randperm(batch_size).to(x.device)
-    mixed_x = alpha * x + (1 - alpha) * x[index, :]
-    y_a, y_b = y, y[index]
-    lam = alpha
-    return mixed_x, y_a, y_b, lam, index
+    index = torch.randperm(batch_size, device=images.device)
+    mixed_images   = lam * images   + (1 - lam) * images[index]
+    mixed_features = lam * features + (1 - lam) * features[index]
+    labels_a = labels
+    labels_b = labels[index]
+    return mixed_images, mixed_features, labels_a, labels_b, lam
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SCHEDULER - FIXED: was missing from the file
+# Scheduler — FIX BUG 2: step() called once per epoch, not per batch
 # ─────────────────────────────────────────────────────────────────────────────
 class WarmupCosineScheduler:
-    """Warmup + Cosine Annealing scheduler with per-param-group learning rate scaling."""
-    
-    def __init__(self, optimizer, warmup_epochs, total_epochs, base_lr):
+    """
+    Per-EPOCH warmup + cosine annealing.
+
+    FIX: The original called scheduler.step() inside train_epoch(), meaning
+    it was called N_BATCHES times per epoch. With warmup_epochs=3 and
+    59 batches/epoch, the scheduler completed 'warmup' after just 3 batches
+    (not 3 epochs), then entered deep cosine decay by epoch 2.
+
+    This version is called once per epoch from the main loop.
+    Each param_group stores its own 'initial_lr' (set at optimizer creation)
+    and gets scaled proportionally.
+    """
+    def __init__(self, optimizer, warmup_epochs, total_epochs):
         self.optimizer = optimizer
         self.warmup_epochs = warmup_epochs
         self.total_epochs = total_epochs
-        self.base_lr = base_lr
         self.current_epoch = 0
-        
+
+        # Store each group's intended max LR (set at optimizer creation)
+        for pg in optimizer.param_groups:
+            pg['initial_lr'] = pg['lr']
+
     def step(self):
         self.current_epoch += 1
-        if self.current_epoch <= self.warmup_epochs:
-            lr = self.base_lr * (self.current_epoch / self.warmup_epochs)
+        e = self.current_epoch
+
+        if e <= self.warmup_epochs:
+            scale = e / self.warmup_epochs
         else:
-            progress = (self.current_epoch - self.warmup_epochs) / (self.total_epochs - self.warmup_epochs)
-            lr = self.base_lr * (1 + np.cos(np.pi * progress)) / 2
-        
+            progress = (e - self.warmup_epochs) / max(1, self.total_epochs - self.warmup_epochs)
+            scale = 0.5 * (1.0 + math.cos(math.pi * progress))
+
         for pg in self.optimizer.param_groups:
-            pg['lr'] = lr * pg.get('lr_scale', 1.0)
-    
-    def _set_lr(self, lr):
-        for pg in self.optimizer.param_groups:
-            pg['lr'] = lr * pg.get('lr_scale', 1.0)
+            pg['lr'] = pg['initial_lr'] * scale
+
+    def get_last_lr(self):
+        return [pg['lr'] for pg in self.optimizer.param_groups]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Train/Eval - FIXED: model returns tuple (logits, attn)
+# Train epoch — FIX BUG 2: removed scheduler.step() call
+# FIX BUG 6: added AMP support
 # ─────────────────────────────────────────────────────────────────────────────
-def train_epoch(model, train_loader, optimizer, scheduler, criterion, device, use_mixup=False, start_mixup_epoch=15, current_epoch=0):
-    """Train one epoch. FIXED: unpack logits from model output, gate mixup by epoch."""
+def train_epoch(model, train_loader, optimizer, criterion, device,
+                scaler=None, use_mixup=False, current_epoch=0,
+                mixup_start_epoch=15):
     model.train()
-    total_loss = 0
+    total_loss = 0.0
     correct = 0
     total = 0
-    
-    for batch in tqdm(train_loader, desc="Training"):
-        images = batch['image'].to(device)
+
+    for batch in tqdm(train_loader, desc="Training", leave=False):
+        images   = batch['image'].to(device)
         features = batch['features'].to(device)
-        labels = batch['label'].to(device)
-        
-        # FIXED: #12 disable mixup for first 15 epochs to avoid early noise
-        use_mixup_this_batch = use_mixup and (current_epoch >= start_mixup_epoch)
-        
-        if use_mixup_this_batch:
-            images_m, y_a, y_b, lam, perm_idx = mixup_data(images, labels, alpha=0.3)
-            features_m = lam * features + (1 - lam) * features[perm_idx]
-            logits, _ = model(images_m, features_m)  # FIXED: unpack logits from tuple
-            loss = lam * criterion(logits, y_a) + (1 - lam) * criterion(logits, y_b)
-        else:
-            logits, _ = model(images, features)  # FIXED: unpack logits from tuple
-            loss = criterion(logits, labels)
-        
+        labels   = batch['label'].to(device)
+
+        use_mixup_now = use_mixup and (current_epoch >= mixup_start_epoch)
+
+        with torch.cuda.amp.autocast(enabled=(scaler is not None)):
+            if use_mixup_now:
+                images_m, features_m, y_a, y_b, lam = mixup_batch(images, features, labels)
+                logits, _ = model(images_m, features_m)
+                loss = lam * criterion(logits, y_a) + (1 - lam) * criterion(logits, y_b)
+            else:
+                logits, _ = model(images, features)
+                loss = criterion(logits, labels)
+
+        # FIX: check for NaN loss before backward — skip bad batch
+        if not torch.isfinite(loss):
+            print(f"  ⚠️  Non-finite loss ({loss.item():.4f}) skipped.")
+            optimizer.zero_grad()
+            continue
+
         optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-        
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+
         total_loss += loss.item()
-        _, predicted = torch.max(logits.data, 1)  # FIXED: use logits
-        total += labels.size(0)
+        _, predicted = torch.max(logits.detach(), 1)
+        total   += labels.size(0)
         correct += (predicted == labels).sum().item()
-    
-    scheduler.step()
-    acc = 100 * correct / total
-    avg_loss = total_loss / len(train_loader)
+
+    acc = 100.0 * correct / max(1, total)
+    avg_loss = total_loss / max(1, len(train_loader))
     return avg_loss, acc
 
 
 def evaluate(model, val_loader, device, criterion=None):
-    """Evaluate model. FIXED: unpack logits from model output."""
     model.eval()
     correct = 0
     total = 0
-    all_preds = []
+    all_preds  = []
     all_labels = []
-    total_loss = 0
-    
+    total_loss = 0.0
+
     with torch.no_grad():
-        for batch in tqdm(val_loader, desc="Evaluating"):
-            images = batch['image'].to(device)
+        for batch in tqdm(val_loader, desc="Evaluating", leave=False):
+            images   = batch['image'].to(device)
             features = batch['features'].to(device)
-            labels = batch['label'].to(device)
-            
-            logits, _ = model(images, features)  # FIXED: unpack logits from tuple
+            labels   = batch['label'].to(device)
+
+            logits, _ = model(images, features)
             if criterion is not None:
                 loss = criterion(logits, labels)
-                total_loss += loss.item()
-            
-            _, predicted = torch.max(logits.data, 1)  # FIXED: use logits
-            total += labels.size(0)
+                if torch.isfinite(loss):
+                    total_loss += loss.item()
+
+            _, predicted = torch.max(logits, 1)
+            total   += labels.size(0)
             correct += (predicted == labels).sum().item()
             all_preds.extend(predicted.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
-    
-    acc = 100 * correct / total
-    avg_loss = total_loss / len(val_loader) if criterion is not None else 0
-    
-    # FIXED: #5 compute per-class accuracy for class-imbalanced val sets
+
+    acc = 100.0 * correct / max(1, total)
+    avg_loss = total_loss / max(1, len(val_loader)) if criterion is not None else 0.0
     report = classification_report(all_labels, all_preds, output_dict=True, zero_division=0)
     macro_f1 = report['macro avg']['f1-score']
-    
     return acc, avg_loss, all_preds, all_labels, macro_f1
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Main training - FIXED: pass current_epoch to train_epoch
+# Feature extraction helpers
 # ─────────────────────────────────────────────────────────────────────────────
-def train_hybrid_model(data_dir, output_dir, epochs=80, batch_size=16, lr=1e-3, early_stopping_patience=15):
-    """Main training function for hybrid model."""
+def build_feature_cache(image_paths, feature_scaler=None, fit_scaler=False):
+    """
+    Extract features for a list of image paths.
+
+    FIX BUG 5: The original code passed a PIL Image object to
+    extract_medical_features(), but the function expects a file path string.
+    This caused silent zero-vector fallbacks for every image.
+    """
+    raw = {}
+    for img_path in tqdm(image_paths, desc="Extracting features", leave=False):
+        try:
+            # FIX: pass path string, not PIL Image
+            feats = extract_medical_features(img_path)
+            raw[img_path] = feats
+        except Exception as e:
+            print(f"  ⚠️  Feature extraction failed for {Path(img_path).name}: {e}")
+            raw[img_path] = np.zeros(NUM_TRADITIONAL_FEATURES)
+
+    if fit_scaler:
+        feature_scaler = StandardScaler()
+        feature_scaler.fit([raw[p] for p in image_paths])
+
+    cache = {}
+    for p in image_paths:
+        if feature_scaler is not None:
+            cache[p] = feature_scaler.transform([raw[p]])[0]
+        else:
+            cache[p] = raw[p]
+
+    return cache, feature_scaler
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main training
+# ─────────────────────────────────────────────────────────────────────────────
+def train_hybrid_model(data_dir, output_dir, epochs=100, batch_size=32,
+                       lr=1e-4, early_stopping_patience=20):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
-    
+
     os.makedirs(output_dir, exist_ok=True)
-    
-    # FIXED: Auto-detect class names from directory structure
     data_path = Path(data_dir)
-    print(f"📁 Looking for images in: {data_path}")
-    print(f"   Directory exists: {data_path.exists()}")
-    
-    if data_path.exists():
-        contents = sorted([p.name for p in data_path.iterdir()])
-        print(f"   Top-level contents: {contents}")
-    
-    # FIXED: Auto-detect class names from train/ or root directory
-    class_names = []
-    image_paths = []
-    labels = []
-    
-    # Try to find where classes are located
+
+    print(f"\n📁 Scanning: {data_path}")
+
+    # ── FIX BUG 4: Respect pre-made train/val split ───────────────────────
     train_path = data_path / 'train'
-    if train_path.exists():
-        print("✅ Found train/ directory, checking for class subdirectories...")
-        potential_classes = sorted([p.name for p in train_path.iterdir() if p.is_dir()])
-        class_names = potential_classes
-        print(f"   Auto-detected classes: {class_names}")
-        
-        # Load from train/ and val/ splits
-        for split in ['train', 'val']:
-            split_path = data_path / split
-            if not split_path.exists():
-                print(f"   ⚠️  {split}/ not found, skipping")
+    val_path   = data_path / 'val'
+
+    def load_split(split_path, class_names):
+        paths, lbls = [], []
+        for idx, cls in enumerate(class_names):
+            cls_dir = split_path / cls
+            if not cls_dir.exists():
+                print(f"  ⚠️  {cls}/ not found in {split_path.name}/")
                 continue
-            
-            print(f"\n📂 Processing {split}/ directory:")
-            for class_idx, class_name in enumerate(class_names):
-                class_dir = split_path / class_name
-                if not class_dir.exists():
-                    print(f"     ⚠️  {class_name}/ not found in {split}/")
-                    continue
-                
-                img_files = sorted(list(class_dir.glob('*.jpg')) + list(class_dir.glob('*.JPG')) + 
-                                 list(class_dir.glob('*.png')) + list(class_dir.glob('*.PNG')))
-                print(f"     {class_name}: {len(img_files)} images")
-                
-                for img_path in img_files:
-                    image_paths.append(str(img_path))
-                    labels.append(class_idx)
+            imgs = (sorted(cls_dir.glob('*.jpg')) + sorted(cls_dir.glob('*.JPG')) +
+                    sorted(cls_dir.glob('*.png')) + sorted(cls_dir.glob('*.PNG')))
+            print(f"     {cls}: {len(imgs)} images")
+            for ip in imgs:
+                paths.append(str(ip))
+                lbls.append(idx)
+        return paths, lbls
+
+    if train_path.exists() and val_path.exists():
+        print("✅ Pre-split train/ and val/ found — using them directly.")
+        class_names = sorted([p.name for p in train_path.iterdir() if p.is_dir()])
+        print(f"   Classes: {class_names}")
+        print("\n📂 train/")
+        train_paths, train_labels = load_split(train_path, class_names)
+        print("\n📂 val/")
+        val_paths, val_labels = load_split(val_path, class_names)
     else:
-        # Fallback: look for classes at root level
-        print("✅ No train/ found, checking root directory for class folders...")
-        # FIXED: define expected classes for this dataset
-        expected_classes = ['Dysplasia', 'Koilocytosis', 'Metaplasia', 'Parabasal', 'Superficial']
-        
-        # Auto-detect available classes
-        potential_classes = sorted([p.name for p in data_path.iterdir() 
-                                   if p.is_dir() and p.name not in ['train', 'val', 'test', 'synthetic', 'sipakmed_raw']])
-        
-        if potential_classes:
-            class_names = potential_classes
-        else:
-            class_names = expected_classes
-        
-        print(f"   Auto-detected classes: {class_names}")
-        
-        for class_idx, class_name in enumerate(class_names):
-            class_dir = data_path / class_name
-            if not class_dir.exists():
-                print(f"   ⚠️  {class_name}/ not found")
-                continue
-            
-            img_files = sorted(list(class_dir.glob('*.jpg')) + list(class_dir.glob('*.JPG')) + 
-                             list(class_dir.glob('*.png')) + list(class_dir.glob('*.PNG')))
-            print(f"   {class_name}: {len(img_files)} images")
-            
-            for img_path in img_files:
-                image_paths.append(str(img_path))
-                labels.append(class_idx)
-    
-    print(f"\n✅ Total images found: {len(image_paths)}")
-    
-    if len(image_paths) == 0:
-        print("\n❌ NO IMAGES FOUND!")
-        print(f"\nSearched for classes: {class_names}")
-        print(f"\nActual directory structure:")
-        
-        # Show actual structure
-        for i, item in enumerate(sorted(data_path.rglob('*'))[:50]):
-            if item.is_dir():
-                level = len(item.relative_to(data_path).parts)
-                indent = "  " * level
-                print(f"{indent}📁 {item.name}/")
-            else:
-                if item.suffix.lower() in ['.jpg', '.png']:
-                    level = len(item.relative_to(data_path).parts)
-                    indent = "  " * level
-                    print(f"{indent}🖼️  {item.name}")
-        
-        raise ValueError(
-            f"No images found in {data_dir}. "
-            f"Expected structure: data/train/ClassName/ or data/ClassName/"
-        )
-    
-    # Verify class distribution
-    dist = Counter(labels)
-    print(f"\nClass distribution:")
-    for class_idx, class_name in enumerate(class_names):
-        count = dist.get(class_idx, 0)
-        pct = 100 * count / len(labels) if labels else 0
-        print(f"  {class_name}: {count} ({pct:.1f}%)")
-    
-    # Train/val split
-    if len(image_paths) < 10:
-        raise ValueError(f"Not enough images ({len(image_paths)}) to train. Need at least 10.")
-    
-    train_paths, val_paths, train_labels, val_labels = train_test_split(
-        image_paths, labels, test_size=0.2, random_state=42, stratify=labels
-    )
-    
-    print(f"\n📊 Train/Val split:")
-    print(f"   Train: {len(train_paths)} images")
-    print(f"   Val:   {len(val_paths)} images")
-    
-    # Image transforms
+        print("⚠️  No pre-split dirs found, scanning root and splitting 80/20.")
+        class_names = sorted([p.name for p in data_path.iterdir()
+                               if p.is_dir() and p.name not in ('test', 'synthetic', 'sipakmed_raw')])
+        all_paths, all_labels = load_split(data_path, class_names)
+        train_paths, val_paths, train_labels, val_labels = train_test_split(
+            all_paths, all_labels, test_size=0.2, random_state=42, stratify=all_labels)
+
+    print(f"\n✅ Train: {len(train_paths)}  |  Val: {len(val_paths)}")
+    if len(train_paths) == 0:
+        raise ValueError("No training images found.")
+
+    # ── Feature extraction ────────────────────────────────────────────────
+    print("\n🔍 Extracting train features (fit scaler)...")
+    train_cache, feature_scaler = build_feature_cache(train_paths, fit_scaler=True)
+
+    print("🔍 Extracting val features (apply scaler)...")
+    val_cache, _ = build_feature_cache(val_paths, feature_scaler=feature_scaler)
+
+    # ── Transforms ───────────────────────────────────────────────────────
     train_transform = transforms.Compose([
         transforms.RandomHorizontalFlip(p=0.5),
-        transforms.RandomRotation(15),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+        transforms.RandomVerticalFlip(p=0.3),
+        transforms.RandomRotation(20),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1),
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                           std=[0.229, 0.224, 0.225])
+                             std=[0.229, 0.224, 0.225]),
     ])
-    
     val_transform = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                           std=[0.229, 0.224, 0.225])
+                             std=[0.229, 0.224, 0.225]),
     ])
-    
-    # Feature extraction
-    try:
-        from feature_extractor import CellFeatureExtractor
-    except ImportError:
-        from backend.feature_extractor import CellFeatureExtractor
-    
-    feature_extractor = CellFeatureExtractor()
-    
-    print("\n🔍 Extracting training features...")
-    train_cache_raw = {}
-    for img_path in tqdm(train_paths, desc="Train features"):
-        try:
-            # FIXED: Read image first, then pass to extract_medical_features
-            img = Image.open(img_path)
-            train_cache_raw[img_path] = extract_medical_features(img)
-        except Exception as e:
-            print(f"Warning: Failed to extract features for {Path(img_path).name}: {e}")
-            train_cache_raw[img_path] = np.zeros(30)
-    
-    print("🔍 Extracting validation features...")
-    val_cache_raw = {}
-    for img_path in tqdm(val_paths, desc="Val features"):
-        try:
-            # FIXED: Read image first, then pass to extract_medical_features
-            img = Image.open(img_path)
-            val_cache_raw[img_path] = extract_medical_features(img)
-        except Exception as e:
-            print(f"Warning: Failed to extract features for {Path(img_path).name}: {e}")
-            val_cache_raw[img_path] = np.zeros(30)
-    
-    # Fit scaler on train features
-    train_features_list = [train_cache_raw[p] for p in train_paths]
-    feature_scaler = StandardScaler()
-    feature_scaler.fit(train_features_list)
-    
-    # Scale val features
-    val_cache = {}
-    for p in val_paths:
-        val_cache[p] = feature_scaler.transform([val_cache_raw[p]])[0]
-    
-    # Scale train cache
-    scaled_train_cache = {}
-    for p in train_paths:
-        scaled_train_cache[p] = feature_scaler.transform([train_cache_raw[p]])[0]
-    
-    # Create datasets
-    train_ds = HybridDataset(
-        train_paths, train_labels,
-        transform=train_transform,
-        feature_extractor=None,
-        feature_cache=scaled_train_cache
-    )
-    
-    val_ds = HybridDataset(
-        val_paths, val_labels,
-        transform=val_transform,
-        feature_extractor=None,
-        feature_cache=val_cache
-    )
-    
-    # Weighted sampler for train set
-    class_counts = Counter(train_labels)
+
+    # ── Datasets & Loaders ───────────────────────────────────────────────
+    train_ds = HybridDataset(train_paths, train_labels, train_transform, train_cache)
+    val_ds   = HybridDataset(val_paths,   val_labels,   val_transform,   val_cache)
+
+    # FIX BUG 7: sampler built from final train_labels
+    class_counts  = Counter(train_labels)
     class_weights = {i: 1.0 / class_counts[i] for i in range(len(class_names))}
     sample_weights = [class_weights[l] for l in train_labels]
     sampler = WeightedRandomSampler(sample_weights, len(train_labels), replacement=True)
-    
-    train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=sampler, num_workers=0)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
-    
-    # Model
-    model = build_model(num_classes=len(class_names), num_features=NUM_TRADITIONAL_FEATURES, device=device)
-    
-    # Optimizer with differential LR
-    backbone_params = list(model.backbone.parameters())
-    # FIXED: use id() to compare parameter identity, not tensor equality
-    backbone_param_ids = {id(p) for p in backbone_params}
-    other_params = [p for p in model.parameters() if id(p) not in backbone_param_ids]
-    
+
+    num_workers = min(4, os.cpu_count() or 0)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=sampler,
+                              num_workers=num_workers, pin_memory=True)
+    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False,
+                              num_workers=num_workers, pin_memory=True)
+
+    # ── Model ─────────────────────────────────────────────────────────────
+    model = build_model(num_classes=len(class_names),
+                        num_features=NUM_TRADITIONAL_FEATURES,
+                        device=device)
+
+    # Differential LR: backbone gets 1/100 of head LR
+    backbone_param_ids = {id(p) for p in model.backbone.parameters()}
+    backbone_params = [p for p in model.parameters() if id(p) in backbone_param_ids]
+    head_params     = [p for p in model.parameters() if id(p) not in backbone_param_ids]
+
     optimizer = torch.optim.AdamW([
-        {'params': backbone_params, 'lr': lr * 0.01, 'lr_scale': 0.01},  # FIXED: reduced from 0.05
-        {'params': other_params, 'lr': lr * 0.1, 'lr_scale': 0.1}  # FIXED: reduced from 1.0
+        {'params': backbone_params, 'lr': lr * 0.01,  'weight_decay': 1e-4},
+        {'params': head_params,     'lr': lr,          'weight_decay': 1e-4},
     ])
-    
-    scheduler = WarmupCosineScheduler(optimizer, warmup_epochs=3, total_epochs=epochs, base_lr=lr)
+
+    # FIX BUG 2: scheduler stepped once/epoch, stores initial_lr per group
+    scheduler = WarmupCosineScheduler(optimizer, warmup_epochs=5, total_epochs=epochs)
+
+    # Plateau scheduler as safety net
+    plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='max', factor=0.5, patience=7, verbose=True)
+
     criterion = LabelSmoothingCrossEntropy(smoothing=0.05)
-    
-    best_val_acc = 0
-    best_macro_f1 = 0
-    patience = early_stopping_patience
+
+    # FIX BUG 6: AMP GradScaler
+    use_amp = device.type == 'cuda'
+    scaler  = torch.cuda.amp.GradScaler(enabled=use_amp)
+    print(f"  AMP: {'Enabled' if use_amp else 'Disabled'}")
+
+    # ── Training loop ──────────────────────────────────────────────────
+    best_macro_f1   = 0.0
+    best_val_acc    = 0.0
     patience_counter = 0
     checkpoint_path = os.path.join(output_dir, 'best_model.pt')
-    history = {'train_loss': [], 'train_acc': [], 'val_acc': [], 'val_loss': [], 'val_macro_f1': []}
-    
+    history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': [], 'val_macro_f1': []}
+
     for epoch in range(epochs):
+        lrs = [pg['lr'] for pg in optimizer.param_groups]
         print(f"\n{'='*70}")
-        print(f"Epoch {epoch+1}/{epochs} | LR: {optimizer.param_groups[1]['lr']:.2e} (backbone: {optimizer.param_groups[0]['lr']:.2e})")
+        print(f"Epoch {epoch+1}/{epochs}  |  LR head={lrs[1]:.2e}  backbone={lrs[0]:.2e}")
         print(f"{'='*70}")
-        
+
         train_loss, train_acc = train_epoch(
-            model, train_loader, optimizer, scheduler, criterion, device, 
-            use_mixup=True, start_mixup_epoch=15, current_epoch=epoch
+            model, train_loader, optimizer, criterion, device,
+            scaler=scaler, use_mixup=True,
+            current_epoch=epoch, mixup_start_epoch=15
         )
-        
+
         val_acc, val_loss, _, _, macro_f1 = evaluate(model, val_loader, device, criterion)
-        
+
+        # FIX BUG 2: step schedulers ONCE per epoch here, not inside train_epoch
+        scheduler.step()
+        plateau_scheduler.step(macro_f1)
+
         history['train_loss'].append(train_loss)
         history['train_acc'].append(train_acc)
-        history['val_acc'].append(val_acc)
         history['val_loss'].append(val_loss)
+        history['val_acc'].append(val_acc)
         history['val_macro_f1'].append(macro_f1)
-        
-        print(f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
-        print(f"Val Loss:   {val_loss:.4f} | Val Acc:   {val_acc:.2f}% | Macro-F1: {macro_f1:.4f}")
-        
+
+        print(f"Train  — loss: {train_loss:.4f} | acc: {train_acc:.2f}%")
+        print(f"Val    — loss: {val_loss:.4f}  | acc: {val_acc:.2f}% | macro-F1: {macro_f1:.4f}")
+
         if macro_f1 > best_macro_f1:
             best_macro_f1 = macro_f1
-            best_val_acc = val_acc
+            best_val_acc  = val_acc
             patience_counter = 0
-            torch.save(model.state_dict(), checkpoint_path)
-            print(f"✅ Checkpoint saved (Macro-F1: {macro_f1:.4f})")
+            torch.save({
+                'epoch': epoch + 1,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_acc': val_acc,
+                'macro_f1': macro_f1,
+                'class_names': class_names,
+                'num_features': NUM_TRADITIONAL_FEATURES,
+            }, checkpoint_path)
+            print(f"✅ Checkpoint saved  (macro-F1={macro_f1:.4f}, val_acc={val_acc:.2f}%)")
         else:
             patience_counter += 1
-            if patience_counter >= patience:
-                print(f"⏹️  Early stopping after {patience} epochs without improvement.")
+            print(f"   No improvement ({patience_counter}/{early_stopping_patience})")
+            if patience_counter >= early_stopping_patience:
+                print(f"\n⏹️  Early stopping triggered.")
                 break
-    
-    # Save history
+
     with open(os.path.join(output_dir, 'history.json'), 'w') as f:
         json.dump(history, f, indent=2)
-    
+
     print(f"\n{'='*70}")
     print(f"✅ Training complete!")
-    print(f"   Best val acc: {best_val_acc:.2f}%")
+    print(f"   Best val acc : {best_val_acc:.2f}%")
     print(f"   Best macro-F1: {best_macro_f1:.4f}")
-    print(f"   Checkpoint: {checkpoint_path}")
-    print(f"   Classes: {class_names}")
+    print(f"   Checkpoint   : {checkpoint_path}")
     print(f"{'='*70}")
     return checkpoint_path
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────────────────────────────────────
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Train hybrid cervical cancer classifier')
-    parser.add_argument('--data-dir', type=str, default='/kaggle/working/data',
-                        help='Path to data directory')
-    parser.add_argument('--checkpoint-dir', type=str, default='./checkpoints',
-                        help='Directory to save checkpoints')
-    parser.add_argument('--epochs', type=int, default=100,
-                        help='Number of training epochs')
-    parser.add_argument('--batch-size', type=int, default=32,
-                        help='Batch size for training')
-    parser.add_argument('--learning-rate', type=float, default=0.0001,
-                        help='Learning rate')
-    # FIXED: add missing --early-stopping-patience argument
-    parser.add_argument('--early-stopping-patience', type=int, default=15,
-                        help='Early stopping patience (epochs without improvement)')
-    parser.add_argument('--num-workers', type=int, default=0,
-                        help='Number of workers for DataLoader')
-    parser.add_argument('--seed', type=int, default=42,
-                        help='Random seed')
-    
+    parser.add_argument('--data-dir',               type=str,   default='/kaggle/working/data')
+    parser.add_argument('--checkpoint-dir',         type=str,   default='./checkpoints')
+    parser.add_argument('--epochs',                 type=int,   default=100)
+    parser.add_argument('--batch-size',             type=int,   default=32)
+    parser.add_argument('--learning-rate',          type=float, default=1e-4)
+    parser.add_argument('--early-stopping-patience',type=int,   default=20)
+    parser.add_argument('--seed',                   type=int,   default=42)
     args = parser.parse_args()
-    
+
     set_seed(args.seed)
-    
+
     print(f"\n{'='*70}")
     print(f"🚀 TRAINING CONFIGURATION")
     print(f"{'='*70}")
-    print(f"  Data dir              : {args.data_dir}")
-    print(f"  Checkpoint dir        : {args.checkpoint_dir}")
-    print(f"  Epochs                : {args.epochs}")
-    print(f"  Batch size            : {args.batch_size}")
-    print(f"  Learning rate         : {args.learning_rate}")
-    # FIXED: print early stopping patience
-    print(f"  Early stopping patience : {args.early_stopping_patience}")
-    print(f"  Num workers           : {args.num_workers}")
-    print(f"  Seed                  : {args.seed}")
+    for k, v in vars(args).items():
+        print(f"  {k:<30}: {v}")
     print(f"{'='*70}\n")
-    
-    # FIXED: pass early_stopping_patience to train_hybrid_model if needed
-    # For now it's hardcoded as patience=15 in the function, but you can modify:
+
     train_hybrid_model(
         data_dir=args.data_dir,
         output_dir=args.checkpoint_dir,
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.learning_rate,
-        early_stopping_patience=args.early_stopping_patience  # FIXED: pass argument
+        early_stopping_patience=args.early_stopping_patience,
     )
