@@ -96,7 +96,7 @@ from sklearn.model_selection import train_test_split
 
 warnings.filterwarnings("ignore")
 
-_SCRIPT_VERSION = "EfficientNet-B3-Hybrid-v5-accuracy-fix"
+_SCRIPT_VERSION = "EfficientNet-B3-Hybrid-v6-overfit-fix"
 print(f"[train_hybrid.py] version={_SCRIPT_VERSION}  file={__file__}")
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -337,11 +337,9 @@ class HybridDataset(Dataset):
 # ─────────────────────────────────────────────────────────────────────────────
 def mixup_batch(images, features, labels, alpha=0.2):
     """
-    True Beta-sampled MixUp.
-
-    FIX BUG 1a: lam is now sampled from Beta(alpha, alpha), not hardcoded.
-    FIX BUG 9:  alpha reduced from 0.4 → 0.2 for medical imaging datasets.
-                start_epoch moved from 2 → 20 (controlled in train_epoch caller).
+    True Beta-sampled MixUp. alpha is ramped gradually by the caller
+    via get_mixup_alpha() — never switched on hard — to prevent the
+    training collapse seen at epoch 21 when alpha jumped 0→0.2 instantly.
     """
     batch_size = images.size(0)
     lam = float(np.random.beta(alpha, alpha))
@@ -353,6 +351,20 @@ def mixup_batch(images, features, labels, alpha=0.2):
     labels_a = labels
     labels_b = labels[index]
     return mixed_images, mixed_features, labels_a, labels_b, lam
+
+
+def get_mixup_alpha(epoch, mixup_start_epoch=15, max_alpha=0.3, ramp_epochs=10):
+    """
+    Ramp MixUp alpha from 0 -> max_alpha over ramp_epochs after mixup_start_epoch.
+    Hard on-switch (old behaviour) caused a 27pt accuracy drop at epoch 21.
+    Gradual ramp gives the model time to adapt to mixed samples.
+    Returns 0.0 before mixup_start_epoch (MixUp fully disabled).
+    """
+    if epoch < mixup_start_epoch:
+        return 0.0
+    ramp = min(1.0, (epoch - mixup_start_epoch) / max(1, ramp_epochs))
+    alpha_now = max_alpha * ramp
+    return alpha_now
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -402,8 +414,7 @@ class WarmupCosineScheduler:
 # ─────────────────────────────────────────────────────────────────────────────
 def train_epoch(model, train_loader, optimizer, criterion, device,
                 scaler=None, use_mixup=False, current_epoch=0,
-                mixup_start_epoch=20,   # FIX BUG 9: was 2
-                mixup_alpha=0.2):       # FIX BUG 9: was 0.4
+                mixup_start_epoch=15, max_mixup_alpha=0.3):
     model.train()
     total_loss = 0.0
     correct    = 0
@@ -432,13 +443,15 @@ def train_epoch(model, train_loader, optimizer, criterion, device,
                 if abs(fmin) < 1e-6 and abs(fmax) < 1e-6:
                     print("  ❌  CRITICAL: features are ALL ZEROS — check extract_medical_features call!")
 
-        use_mixup_now = use_mixup and (current_epoch >= mixup_start_epoch)
+        # Gradual MixUp ramp — alpha grows 0→max over ramp_epochs after start
+        alpha_now = get_mixup_alpha(current_epoch, mixup_start_epoch, max_mixup_alpha)
+        use_mixup_now = use_mixup and (alpha_now > 0.0)
 
         # FIX BUG 6: AMP autocast
         with torch.cuda.amp.autocast(enabled=(scaler is not None)):
             if use_mixup_now:
                 images_m, features_m, y_a, y_b, lam = mixup_batch(
-                    images, features, labels, alpha=mixup_alpha
+                    images, features, labels, alpha=alpha_now
                 )
                 logits, _ = model(images_m, features_m)
                 loss = lam * criterion(logits, y_a) + (1 - lam) * criterion(logits, y_b)
@@ -716,7 +729,13 @@ def train_hybrid_model(data_dir, output_dir, epochs=80, batch_size=16,
 
     # FIX BUG 7: sampler uses final train_labels (after all splitting logic)
     class_counts   = Counter(train_labels)
-    class_weights  = {i: 1.0 / class_counts[i] for i in range(len(class_names))}
+    # Find the Normal class index (smallest class at ~198 samples vs ~400 others)
+    # Give it 2x weight to compensate for 2x underrepresentation
+    normal_idx = class_names.index('Normal') if 'Normal' in class_names else -1
+    def _cls_weight(i):
+        base = 1.0 / class_counts[i]
+        return base * 2.0 if i == normal_idx else base
+    class_weights  = {i: _cls_weight(i) for i in range(len(class_names))}
     sample_weights = [class_weights[l] for l in train_labels]
     sampler = WeightedRandomSampler(sample_weights, len(train_labels), replacement=True)
 
@@ -731,7 +750,7 @@ def train_hybrid_model(data_dir, output_dir, epochs=80, batch_size=16,
         num_classes=len(class_names),
         num_features=NUM_TRADITIONAL_FEATURES,
         device=device,
-        dropout=0.4,
+        dropout=0.5,   # increased from 0.4 to fight overfitting (38pt train-val gap)
     )
 
     # FIX BUG 12: freeze backbone initially; unfreeze after BACKBONE_FREEZE_EPOCHS
@@ -744,8 +763,8 @@ def train_hybrid_model(data_dir, output_dir, epochs=80, batch_size=16,
 
     # backbone lr is set intentionally low; it will be used after unfreezing
     optimizer = torch.optim.AdamW([
-        {'params': backbone_params, 'lr': lr * 0.1,  'weight_decay': 1e-4},  # 5e-5
-        {'params': head_params,     'lr': lr,         'weight_decay': 1e-4},  # 5e-4
+        {'params': backbone_params, 'lr': lr * 0.1,  'weight_decay': 5e-4},  # stronger L2
+        {'params': head_params,     'lr': lr,         'weight_decay': 5e-4},  # fights 38pt gap
     ])
 
     # FIX BUG 2 + 3: WarmupCosineScheduler with per-group initial_lr
@@ -757,7 +776,10 @@ def train_hybrid_model(data_dir, output_dir, epochs=80, batch_size=16,
         dtype=torch.float32, device=device
     )
     class_weights_tensor = class_weights_tensor / class_weights_tensor.sum() * len(class_names)
-    criterion = FocalLoss(alpha=0.25, gamma=2.0, weight=class_weights_tensor)
+    # Use LabelSmoothing (0.1) + class weights: reduces overconfidence that causes
+    # the train/val gap. FocalLoss is aggressive on easy examples and can
+    # encourage overfit when the model gets too confident on train samples.
+    criterion = nn.CrossEntropyLoss(weight=class_weights_tensor, label_smoothing=0.1)
 
     # ── AMP — FIX BUG 6 ──────────────────────────────────────────────────
     use_amp = torch.cuda.is_available()
@@ -802,8 +824,8 @@ def train_hybrid_model(data_dir, output_dir, epochs=80, batch_size=16,
             scaler=scaler,
             use_mixup=True,
             current_epoch=epoch,
-            mixup_start_epoch=20,   # FIX BUG 9: was 2
-            mixup_alpha=0.2,        # FIX BUG 9: was 0.4
+            mixup_start_epoch=15,   # start gentle ramp at epoch 15
+            max_mixup_alpha=0.3,    # ramp to 0.3 over 10 epochs (reaches full at ep 25)
         )
 
         val_acc, val_loss, _, _, macro_f1 = evaluate(
@@ -814,9 +836,10 @@ def train_hybrid_model(data_dir, output_dir, epochs=80, batch_size=16,
         scheduler.step()
         new_lrs = [pg['lr'] for pg in optimizer.param_groups]
 
+        mixup_alpha_now = get_mixup_alpha(epoch, mixup_start_epoch=15, max_alpha=0.3)
         print(f"Train  — loss: {train_loss:.4f} | acc: {train_acc:.2f}%")
         print(f"Val    — loss: {val_loss:.4f}  | acc: {val_acc:.2f}% | macro-F1: {macro_f1:.4f}")
-        print(f"LR     — head={new_lrs[1]:.2e}  backbone={new_lrs[0]:.2e}")
+        print(f"LR     — head={new_lrs[1]:.2e}  backbone={new_lrs[0]:.2e}  | mixup_alpha={mixup_alpha_now:.3f}")
 
         history['train_loss'].append(train_loss)
         history['train_acc'].append(train_acc)
@@ -871,7 +894,7 @@ if __name__ == '__main__':
     parser.add_argument('--checkpoint-dir',          type=str,   default='./checkpoints')
     parser.add_argument('--epochs',                  type=int,   default=80)
     parser.add_argument('--batch-size',              type=int,   default=16)
-    parser.add_argument('--learning-rate',           type=float, default=5e-4)   # FIX BUG 8
+    parser.add_argument('--learning-rate',           type=float, default=5e-4)
     parser.add_argument('--early-stopping-patience', type=int,   default=15)
     parser.add_argument('--num-workers',             type=int,   default=4)
     parser.add_argument('--seed',                    type=int,   default=42)
