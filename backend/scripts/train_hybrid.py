@@ -1,68 +1,25 @@
 """
-train_hybrid.py — v10 (CIN-confusion fix + 80-90% accuracy push)
+train_hybrid.py — v11 (SIPaKMeD + Herlev | 4-class ordinal)
 ═══════════════════════════════════════════════════════════════════
 
-DIAGNOSIS FROM v9 LOGS (epochs 1-61):
-──────────────────────────────────────
-Per-class accuracy at epoch 60:
-  Normal : 94-100%  ← trivially easy (distinct morphology)
-  Cancer : 48-66%   ← moderate
-  CIN1   : 34-42%   ← bad
-  CIN2   : 26-45%   ← bad
-  CIN3   : 16-29%   ← catastrophic
+DATASET: SIPaKMeD real Pap smear cells + Herlev carcinoma-in-situ
+         + optional img2img synthetic augmentation
 
-CONCLUSION: The model collapses CIN1/CIN2/CIN3 into each other.
-These are ordinal grades (Normal < CIN1 < CIN2 < CIN3 < Cancer)
-and the standard 5-way softmax treats them as unrelated categories,
-giving no credit for being "one grade off."
+4 CLASSES (severity order):
+  0 — Normal     : SIPaKMeD Superficial-Intermediate + Parabasal + Metaplastic
+  1 — CIN1       : SIPaKMeD Koilocytotic
+  2 — HighGrade  : SIPaKMeD Dyskeratotic  (CIN2 + CIN3 merged)
+  3 — Cancer     : Herlev carcinoma_in_situ
 
-ROOT CAUSES AND FIXES:
-══════════════════════
-
-FIX A — Ordinal loss (replaces FocalLoss for CIN grades)
-  The biggest accuracy killer. CIN1/2/3 differ only in the fraction
-  of abnormal cells in the epithelium. Standard CE has equal penalty
-  for CIN1->Normal vs CIN1->CIN3 — wrong. We add an ordinal auxiliary
-  loss: cumulative binary classifiers (is_grade >= k for k=1..4).
-  This forces the model to learn the severity axis.
-  Combined loss = 0.7 * CE + 0.3 * OrdinalLoss.
-
-FIX B — MixUp alpha WAY too high (0.3 max on 2331 samples)
-  With alpha=0.3 and only 2331 training images, every batch is a
-  heavily blended mix. The model NEVER sees clean CIN2/CIN3 examples
-  because those classes only have ~116/114 val samples. MixUp alpha
-  should scale with dataset size. With ~460-560 per class, max 0.1.
-  Also: MixUp should NOT apply to Normal+CIN or Cancer+CIN mixtures.
-  Use class-aware MixUp that only mixes within adjacent grades.
-  FIXED: max_alpha=0.1, class-constrained mixing, start at epoch 20.
-
-FIX C — LR dying too fast then jumping (cosine restarts = instability)
-  At epoch 47-49, head_lr drops to 3-5e-6 then jumps to 5e-5 at ep56.
-  SWA model is evaluated before BN is updated so scores are unreliable.
-  FIXED: Single clean cosine decay per phase. Mini BN update before
-  every SWA eval (60 batches = ~30s, makes SWA scores meaningful).
-
-FIX D — SWA evaluated without BN update = garbage scores
-  SWA [SWA] scores (0.44-0.47) consistently BELOW base model (0.46-0.47)
-  because BN stats are stale. Every SWA checkpoint saved is worse.
-  FIXED: mini_bn_update() before each SWA eval.
-
-FIX E — Backbone unfreezing too fast (all 9 stages by epoch 33)
-  At epoch 33, train acc is only 39%. Head not strong enough to guide
-  the full backbone. Caused oscillation in epochs 30-49.
-  FIXED: Unfreeze 1 stage every 5 epochs (was every 3).
-
-FIX F — Head dropout too high for tiny dataset
-  0.4 dropout on 768 units with 2331 samples = underfitting to CIN.
-  FIXED: dropout=0.3 (head), 0.15 (mid), 0.07 (final).
-
-FIX G — Sampler over-weights wrong classes
-  2x Normal weight was over-sampling an already easy class (98-100% acc).
-  FIXED: 3x weight for CIN2/CIN3/Cancer (hard classes). 1x for CIN1/Normal.
-
-FIX H — Checkpoint criterion ignores class balance
-  Max F1 misses cases where balanced accuracy improves but F1 stays flat.
-  FIXED: Checkpoint on max(F1, balanced_acc improvement).
+KEY CHANGES FROM v10:
+  - SEVERITY_ORDER updated to 4-class scheme
+  - NUM_FEATURES = 31  (30 medical + 1 is_synthetic flag)
+  - Sampler: HighGrade + Cancer get 3x weight (Normal is now abundant)
+  - Hard-class list updated: HighGrade, Cancer
+  - Data loader: accepts flat folder OR train/val split
+  - Synthetic flag injected into feature vector automatically
+  - SWA_START lowered to 45 (more data → faster convergence)
+  - Checkpoint keys updated (saves class_names correctly)
 """
 
 import os
@@ -91,7 +48,7 @@ from sklearn.model_selection import train_test_split
 
 warnings.filterwarnings("ignore")
 
-_VERSION = "EfficientNet-B3-Hybrid-v10-ordinal-CIN-fix"
+_VERSION = "EfficientNet-B3-Hybrid-v11-sipakmed-4class"
 print(f"[train_hybrid.py] version={_VERSION}  file={__file__}")
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -101,13 +58,13 @@ USE_SAM    = False
 USE_TTA    = True
 USE_SWA    = True
 USE_CUTMIX = True
-SWA_START  = 55
+SWA_START  = 45          # lowered from 55 — more data converges faster
 TTA_EVERY  = 5
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Architecture constants
 # ─────────────────────────────────────────────────────────────────────────────
-NUM_FEATURES    = 30
+NUM_FEATURES    = 31     # 30 medical features + 1 is_synthetic flag
 INPUT_SIZE      = 300
 FEAT_DIM        = 128
 CNN_DIM         = 1536
@@ -118,8 +75,12 @@ UNFREEZE_STEP   = 5
 ORDINAL_WEIGHT  = 0.3
 CE_WEIGHT       = 0.7
 
-# Severity order — MUST match label assignment
-SEVERITY_ORDER = ['Normal', 'CIN1', 'CIN2', 'CIN3', 'Cancer']
+# ── 4-class severity order ────────────────────────────────────────────────────
+# MUST match your folder names exactly (case-sensitive)
+SEVERITY_ORDER = ['Normal', 'CIN1', 'HighGrade', 'Cancer']
+
+# Classes that get 3x sampler weight (harder / less represented)
+HARD_CLASSES   = {'HighGrade', 'Cancer'}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Path setup
@@ -148,29 +109,22 @@ def set_seed(seed=42):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ORDINAL LOSS — key fix for CIN1/CIN2/CIN3 confusion
+# ORDINAL LOSS
 # ─────────────────────────────────────────────────────────────────────────────
 class OrdinalLoss(nn.Module):
     """
     Cumulative-link ordinal regression loss.
-
-    For K severity-ordered classes (0..K-1), learns K-1 binary classifiers:
-      P(Y >= k)  for k = 1..K-1
-
-    This gives partial credit for near-misses:
-      predicting CIN2 when truth=CIN3 is penalised LESS than predicting Normal.
-
-    ordinal_logits: (B, K-1) from a separate Linear head
-    targets:        (B,) class indices 0..K-1
+    For K ordered classes learns K-1 binary classifiers: P(Y >= k).
+    Gives partial credit: predicting CIN1 when truth=HighGrade is penalised
+    less than predicting Normal.
     """
-    def __init__(self, num_classes=5, smoothing=0.05):
+    def __init__(self, num_classes=4, smoothing=0.05):
         super().__init__()
         self.K = num_classes
         self.s = smoothing
 
     def forward(self, logits, targets):
         B, K1 = logits.shape
-        # Binary targets: 1 if true_class >= threshold k
         bt = torch.zeros(B, K1, device=targets.device)
         for k in range(1, self.K):
             bt[:, k-1] = (targets >= k).float()
@@ -179,11 +133,8 @@ class OrdinalLoss(nn.Module):
 
 
 class FocalLoss(nn.Module):
-    """
-    Focal Loss, no per-class weights (sampler handles balance).
-    gamma=1.0 — gentler; ordinal loss handles hard CIN negatives.
-    """
-    def __init__(self, gamma=1.0, smoothing=0.08, num_classes=5):
+    """Focal Loss — gamma=1.0 (gentle). Sampler handles class balance."""
+    def __init__(self, gamma=1.0, smoothing=0.08, num_classes=4):
         super().__init__()
         self.gamma = gamma
         self.s = smoothing
@@ -215,8 +166,8 @@ class ChannelSE(nn.Module):
 
 
 class FeatureMLP(nn.Module):
-    """3-block MLP with learned gate. No skip connection."""
-    def __init__(self, in_dim=30, out_dim=128, dropout=0.25):
+    """3-block MLP with learned gate. Accepts 31-dim input (30 medical + 1 syn flag)."""
+    def __init__(self, in_dim=31, out_dim=128, dropout=0.25):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(in_dim, 256), nn.BatchNorm1d(256), nn.GELU(), nn.Dropout(dropout),
@@ -233,12 +184,12 @@ class FeatureMLP(nn.Module):
 
 class EfficientNetHybrid(nn.Module):
     """
-    EfficientNet-B3 + FeatureMLP with SE attention.
+    EfficientNet-B3 + FeatureMLP (31-dim) with SE attention.
     Two heads:
-      - main head: 5-class classifier
-      - ordinal head: 4 binary thresholds (forces severity axis learning)
+      - main head:    4-class classifier
+      - ordinal head: 3 binary thresholds (Normal<CIN1<HighGrade<Cancer)
     """
-    def __init__(self, num_classes=5, num_features=30,
+    def __init__(self, num_classes=4, num_features=31,
                  feat_dim=128, dropout=0.3, drop_path_rate=0.2):
         super().__init__()
         self.num_classes = num_classes
@@ -261,7 +212,6 @@ class EfficientNetHybrid(nn.Module):
         fusion = self.cnn_dim + feat_dim
         self.se = ChannelSE(fusion, r=16)
 
-        # Main head — lighter than v9
         self.head = nn.Sequential(
             nn.Dropout(dropout),
             nn.Linear(fusion, 512), nn.BatchNorm1d(512), nn.GELU(),
@@ -271,7 +221,7 @@ class EfficientNetHybrid(nn.Module):
             nn.Linear(256, num_classes),
         )
 
-        # Ordinal auxiliary head
+        # ordinal head: num_classes-1 = 3 thresholds
         self.ordinal_head = nn.Sequential(
             nn.Dropout(dropout*0.5),
             nn.Linear(fusion, 128), nn.GELU(),
@@ -318,9 +268,9 @@ def build_model(num_classes, num_features, device, dropout=0.3, dpr=0.2):
     m = EfficientNetHybrid(num_classes, num_features, FEAT_DIM, dropout, dpr).to(device)
     n = sum(p.numel() for p in m.parameters())
     t = sum(p.numel() for p in m.parameters() if p.requires_grad)
-    print(f"  Model      : EfficientNetHybrid-v10 @ {INPUT_SIZE}x{INPUT_SIZE}")
+    print(f"  Model      : EfficientNetHybrid-v11 @ {INPUT_SIZE}x{INPUT_SIZE}")
     print(f"  Fusion dim : {FUSION_DIM}  |  Params: {n:,} ({t:,} trainable)")
-    print(f"  Device     : {device}  |  Classes: {num_classes}")
+    print(f"  Device     : {device}  |  Classes: {num_classes}  |  Features: {num_features}")
     return m
 
 
@@ -354,12 +304,14 @@ def unfreeze_progressive(model, epoch, freeze_start):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Dataset
+# Dataset — injects is_synthetic flag automatically from filename
 # ─────────────────────────────────────────────────────────────────────────────
 class HybridDataset(Dataset):
     def __init__(self, paths, labels, transform=None, cache=None):
-        self.paths=paths; self.labels=labels
-        self.transform=transform; self.cache=cache or {}
+        self.paths   = paths
+        self.labels  = labels
+        self.transform = transform
+        self.cache   = cache or {}
 
     def __len__(self): return len(self.paths)
 
@@ -367,11 +319,20 @@ class HybridDataset(Dataset):
         p   = self.paths[idx]
         img = Image.open(p).convert('RGB')
         if self.transform: img = self.transform(img)
-        feat = self.cache.get(p, np.zeros(NUM_FEATURES))
-        return {'image': img,
-                'features': torch.FloatTensor(feat),
-                'label': torch.tensor(self.labels[idx], dtype=torch.long),
-                'path': p}
+
+        # 30 medical features from cache
+        med_feat = self.cache.get(p, np.zeros(NUM_FEATURES - 1, dtype=np.float32))
+
+        # 31st feature: 1.0 if synthetic (filename contains 'syn_'), else 0.0
+        is_syn = 1.0 if 'syn_' in Path(p).name else 0.0
+        feat   = np.append(med_feat, is_syn).astype(np.float32)
+
+        return {
+            'image':    img,
+            'features': torch.FloatTensor(feat),
+            'label':    torch.tensor(self.labels[idx], dtype=torch.long),
+            'path':     p,
+        }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -415,20 +376,26 @@ def tta_transforms(sz=300):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Class-constrained MixUp — only adjacent grades
+# Class-constrained MixUp — only adjacent grades, never syn+real cross-class
 # ─────────────────────────────────────────────────────────────────────────────
 def adjacent_mixup(images, features, labels, alpha=0.1):
-    """Mix only samples with |label_a - label_b| <= 1 (adjacent severity)."""
+    """Mix only samples with |label_a - label_b| <= 1 AND same domain."""
     B   = images.size(0)
     lam = float(np.random.beta(alpha, alpha))
     lam = max(0.1, min(0.9, lam))
     perm = torch.randperm(B, device=images.device)
     la, lb = labels, labels[perm]
-    adj = (torch.abs(la.float()-lb.float()) <= 1).float().view(-1,1,1,1)
-    mixed_img  = adj*(lam*images + (1-lam)*images[perm]) + (1-adj)*images
-    mixed_feat = adj.squeeze()*(lam*features + (1-lam)*features[perm]) + \
-                 (1-adj.squeeze())*features
-    return mixed_img, mixed_feat, la, lb, lam, adj.squeeze()
+
+    # adjacent grade mask
+    adj = (torch.abs(la.float()-lb.float()) <= 1).float()
+    # same domain mask (both real or both synthetic — last feature is the flag)
+    same_dom = (features[:, -1] == features[perm, -1]).float()
+    mask = (adj * same_dom).view(-1,1,1,1)
+
+    mixed_img  = mask*(lam*images + (1-lam)*images[perm]) + (1-mask)*images
+    mixed_feat = mask.squeeze()*(lam*features + (1-lam)*features[perm]) + \
+                 (1-mask.squeeze())*features
+    return mixed_img, mixed_feat, la, lb, lam, mask.squeeze()
 
 
 def cutmix_fn(images, features, labels, alpha=0.1):
@@ -436,7 +403,7 @@ def cutmix_fn(images, features, labels, alpha=0.1):
     lam = float(np.random.beta(alpha, alpha))
     lam = max(0.1, min(0.9, lam))
     idx = torch.randperm(B, device=images.device)
-    r = math.sqrt(1-lam)
+    r   = math.sqrt(1-lam)
     ch, cw = int(H*r), int(W*r)
     cx, cy = random.randint(0,W), random.randint(0,H)
     x1,x2 = max(0,cx-cw//2), min(W,cx+cw//2)
@@ -448,7 +415,6 @@ def cutmix_fn(images, features, labels, alpha=0.1):
 
 
 def get_aug_params(epoch):
-    """MixUp starts ep20 alpha=0.05->0.10. CutMix starts ep30."""
     if epoch < 20:
         return False, False, 0.
     alpha = min(0.10, 0.05 + 0.005*(epoch-20))
@@ -524,9 +490,10 @@ def train_epoch(model, loader, opt, ce_fn, ord_fn, device, scaler, epoch):
 
         if first:
             first=False
-            fmin,fmax = feats.min().item(), feats.max().item()
+            fmin,fmax = feats[:,:-1].min().item(), feats[:,:-1].max().item()
+            syn_pct   = feats[:,-1].mean().item()*100
             ok = "✅" if not (abs(fmin)<1e-6 and abs(fmax)<1e-6) else "❌ ALL ZERO"
-            print(f"  feat [{fmin:.2f},{fmax:.2f}] {ok}")
+            print(f"  feat[0:30] [{fmin:.2f},{fmax:.2f}] {ok} | syn_flag={syn_pct:.0f}%")
 
         lam=1.; la=lb=lbls; adj_mask=None
 
@@ -542,13 +509,10 @@ def train_epoch(model, loader, opt, ce_fn, ord_fn, device, scaler, epoch):
 
             if lam < 1.:
                 if adj_mask is not None:
-                    # Per-sample: use mixed loss only where adj_mask=1
                     ce_a = ce_fn(logits, la)
                     ce_b = ce_fn(logits, lb)
-                    ce = (adj_mask*(lam*ce_a+(1-lam)*ce_b) +
-                          (1-adj_mask)*ce_a).mean() if ce_a.dim()==0 else \
-                         (lam*ce_a + (1-lam)*ce_b)
-                    ol = ord_fn(ord_logits, la)
+                    ce   = (lam*ce_a + (1-lam)*ce_b)
+                    ol   = ord_fn(ord_logits, la)
                 else:
                     ce = lam*ce_fn(logits,la) + (1-lam)*ce_fn(logits,lb)
                     ol = lam*ord_fn(ord_logits,la) + (1-lam)*ord_fn(ord_logits,lb)
@@ -623,20 +587,20 @@ def evaluate(model, loader, device, ce_fn, class_names,
             cp = [p for p,t in zip(preds,tgts) if t==i]
             ca = 100*sum(p==i for p in cp)/max(1,len(ct))
             pr = rep.get(n,{})
-            print(f"    {n:8s}: acc={ca:5.1f}%  F1={pr.get('f1-score',0):.3f}"
+            print(f"    {n:10s}: acc={ca:5.1f}%  F1={pr.get('f1-score',0):.3f}"
                   f"  P={pr.get('precision',0):.3f}  R={pr.get('recall',0):.3f} (n={len(ct)})")
         cm = confusion_matrix(tgts, preds)
         print("\n  Confusion matrix (rows=true, cols=pred):")
-        hdr = "          " + "".join(f"{c[:5]:>7}" for c in class_names)
+        hdr = "            " + "".join(f"{c[:8]:>9}" for c in class_names)
         print(hdr)
         for i,row in enumerate(cm):
-            print(f"  {class_names[i][:7]:7s}  "+"".join(f"{v:7d}" for v in row))
+            print(f"  {class_names[i][:9]:9s}  "+"".join(f"{v:9d}" for v in row))
 
     return acc, bacc, loss, f1, preds, tgts
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Feature extraction
+# Feature extraction (30 medical features only — syn flag added in Dataset)
 # ─────────────────────────────────────────────────────────────────────────────
 def sanitize(arr):
     return np.clip(np.nan_to_num(np.array(arr,np.float32),
@@ -644,21 +608,23 @@ def sanitize(arr):
 
 
 def build_cache(paths, scaler=None, fit=False):
+    """Extract 30 medical features per image. Synthetic flag added in Dataset."""
     raw,nbad = {},0
+    N_MED = NUM_FEATURES - 1   # 30
     for p in tqdm(paths, desc="Features", leave=False):
         try:
             f = extract_medical_features(Image.open(p).convert('RGB'))
             f = sanitize(f)
-            if len(f) != NUM_FEATURES:
-                raise ValueError(f"len={len(f)}")
+            if len(f) != N_MED:
+                raise ValueError(f"expected {N_MED} features, got {len(f)}")
         except Exception:
-            f = np.zeros(NUM_FEATURES, np.float32); nbad+=1
+            f = np.zeros(N_MED, np.float32); nbad+=1
         raw[p]=f
 
     if nbad:
         pct=100*nbad/max(1,len(paths))
-        print(f"  ⚠️  {nbad} ({pct:.1f}%) failures")
-        if pct>30: print("  ❌  >30% failures!")
+        print(f"  ⚠️  {nbad} ({pct:.1f}%) feature failures")
+        if pct>30: print("  ❌  >30% failures — check feature_extractor!")
 
     sample = np.concatenate([raw[p] for p in list(raw)[:10]])
     if np.allclose(sample,0.):
@@ -700,19 +666,20 @@ def train(data_dir, output_dir, epochs=100, batch_size=32,
             if not d.exists(): continue
             imgs=(sorted(d.glob('*.jpg'))+sorted(d.glob('*.JPG'))+
                   sorted(d.glob('*.png'))+sorted(d.glob('*.PNG'))+
-                  sorted(d.glob('*.jpeg')))
+                  sorted(d.glob('*.jpeg'))+sorted(d.glob('*.bmp'))+
+                  sorted(d.glob('*.BMP')))
             print(f"     {c}: {len(imgs)}")
             for x in imgs: paths.append(str(x)); lbls.append(i)
         return paths,lbls
 
     if trp.exists() and vap.exists():
         cls = sorted([p.name for p in trp.iterdir() if p.is_dir()])
-        print(f"✅ Classes (alphabetical): {cls}")
+        print(f"✅ Classes found (alphabetical): {cls}")
         print("📂 train/"); tr_p,tr_l = load_split(trp,cls)
         print("📂 val/");   va_p,va_l = load_split(vap,cls)
         vc = Counter(va_l)
-        if max(vc.values())/max(min(vc.values()),1) > 3:
-            print(f"⚠️  Val imbalanced — re-splitting 80/20")
+        if len(vc) > 0 and max(vc.values())/max(min(vc.values()),1) > 3:
+            print(f"⚠️  Val imbalanced — re-splitting 80/20 stratified")
             ap,al = tr_p+va_p, tr_l+va_l
             tr_p,va_p,tr_l,va_l = train_test_split(
                 ap,al,test_size=0.2,random_state=42,stratify=al)
@@ -720,8 +687,11 @@ def train(data_dir, output_dir, epochs=100, batch_size=32,
             for i,n in enumerate(cls):
                 print(f"   {n}: train={tc[i]}  val={vc2[i]}")
     else:
+        # Flat folder: data_dir/ClassName/*.jpg
         cls = sorted([p.name for p in dp.iterdir()
-                      if p.is_dir() and p.name not in ('test','synthetic','sipakmed_raw')])
+                      if p.is_dir() and p.name not in
+                      ('test','synthetic','sipakmed_raw','__pycache__')])
+        print(f"✅ Classes found (flat): {cls}")
         ap,al = load_split(dp,cls)
         tr_p,va_p,tr_l,va_l = train_test_split(ap,al,test_size=0.2,
                                                  random_state=42,stratify=al)
@@ -729,7 +699,7 @@ def train(data_dir, output_dir, epochs=100, batch_size=32,
     print(f"\n✅ Train: {len(tr_p)}  Val: {len(va_p)}")
     if not tr_p: raise ValueError("No training images found.")
 
-    # Remap labels to severity order for ordinal loss to work correctly
+    # Remap to severity order
     sev_present = [c for c in SEVERITY_ORDER if c in cls]
     if set(sev_present) == set(cls):
         old2new = {cls.index(c): sev_present.index(c) for c in cls}
@@ -738,12 +708,20 @@ def train(data_dir, output_dir, epochs=100, batch_size=32,
         cls  = sev_present
         print(f"✅ Labels remapped to severity order: {cls}")
     else:
-        print(f"⚠️  Cannot remap to severity order. Ordinal loss may be less effective.")
+        missing = set(cls) - set(SEVERITY_ORDER)
+        print(f"⚠️  Unknown classes {missing} — ordinal loss may be less effective.")
+        print(f"   Expected: {SEVERITY_ORDER}")
+
+    # Synthetic image count report
+    syn_tr = sum(1 for p in tr_p if 'syn_' in Path(p).name)
+    syn_va = sum(1 for p in va_p if 'syn_' in Path(p).name)
+    print(f"   Synthetic images — train: {syn_tr} ({100*syn_tr/max(1,len(tr_p)):.1f}%)"
+          f"  val: {syn_va} ({100*syn_va/max(1,len(va_p)):.1f}%)")
 
     # ── Features ──────────────────────────────────────────────────────────
-    print("\n🔍 Train features...")
+    print("\n🔍 Extracting train features (30 medical dims)...")
     tr_cache, scaler = build_cache(tr_p, fit=True)
-    print("🔍 Val features...")
+    print("🔍 Extracting val features...")
     va_cache, _      = build_cache(va_p, scaler=scaler)
 
     # ── Datasets & loaders ────────────────────────────────────────────────
@@ -751,9 +729,9 @@ def train(data_dir, output_dir, epochs=100, batch_size=32,
     va_ds = HybridDataset(va_p, va_l, val_transform(INPUT_SIZE),   va_cache)
     tta_t = tta_transforms(INPUT_SIZE) if USE_TTA else None
 
-    # 3x weight for hard classes: CIN2, CIN3, Cancer
+    # Sampler: 3x weight for HighGrade and Cancer
     tc       = Counter(tr_l)
-    hard_idx = {cls.index(c) for c in ['CIN2','CIN3','Cancer'] if c in cls}
+    hard_idx = {cls.index(c) for c in HARD_CLASSES if c in cls}
     sw       = [(1./tc[l])*(3. if l in hard_idx else 1.) for l in tr_l]
     sampler  = WeightedRandomSampler(sw, len(tr_l), replacement=True)
 
@@ -790,13 +768,14 @@ def train(data_dir, output_dir, epochs=100, batch_size=32,
     swa_model  = AveragedModel(model) if USE_SWA else None
 
     print(f"\n{'='*70}")
-    print(f"  v10 key changes:")
-    print(f"  - Loss: {CE_WEIGHT}xFocalLoss + {ORDINAL_WEIGHT}xOrdinalLoss")
-    print(f"  - Adjacent-grade MixUp only (alpha<=0.10, starts ep20)")
-    print(f"  - CIN2/CIN3/Cancer get 3x sampler weight")
-    print(f"  - Backbone unfreeze: 1 stage per {UNFREEZE_STEP} epochs (slower)")
-    print(f"  - SWA: mini BN update before every eval (real scores)")
-    print(f"  - Checkpoint on F1 + balanced accuracy")
+    print(f"  v11 — SIPaKMeD 4-class config:")
+    print(f"  Classes       : {cls}")
+    print(f"  Loss          : {CE_WEIGHT}xFocalLoss + {ORDINAL_WEIGHT}xOrdinalLoss")
+    print(f"  Features      : {NUM_FEATURES} (30 medical + 1 synthetic flag)")
+    print(f"  Hard classes  : {HARD_CLASSES} → 3x sampler weight")
+    print(f"  MixUp         : adjacent-grade only, same-domain, starts ep20")
+    print(f"  SWA start     : epoch {SWA_START}")
+    print(f"  Backbone      : 1 stage unfrozen per {UNFREEZE_STEP} epochs")
     print(f"{'='*70}\n")
 
     best_f1=best_bacc=best_acc=0.
@@ -809,7 +788,7 @@ def train(data_dir, output_dir, epochs=100, batch_size=32,
         print(f"Epoch {ep+1}/{epochs}")
         print(f"{'='*70}")
 
-        # Unfreeze
+        # Progressive unfreeze
         if not unfrz and ep >= FREEZE_EPOCHS:
             unfrz = True
             unfreeze_progressive(model, ep, FREEZE_EPOCHS)
@@ -861,11 +840,19 @@ def train(data_dir, output_dir, epochs=100, batch_size=32,
             best_f1=f1; best_bacc=va_bacc; best_acc=va_acc; pat=0
             sm = swa_model if use_swa else model
             torch.save({
-                'epoch':ep+1, 'model_state_dict':sm.state_dict(),
-                'val_acc':va_acc,'val_bacc':va_bacc,'macro_f1':f1,
-                'class_names':cls,'num_features':NUM_FEATURES,
-                'feat_dim':FEAT_DIM,'input_size':INPUT_SIZE,
-                'version':_VERSION,'use_swa':use_swa,
+                'epoch':         ep+1,
+                'model_state_dict': sm.state_dict(),
+                'val_acc':       va_acc,
+                'val_bacc':      va_bacc,
+                'macro_f1':      f1,
+                'class_names':   cls,
+                'num_classes':   len(cls),
+                'num_features':  NUM_FEATURES,
+                'feat_dim':      FEAT_DIM,
+                'input_size':    INPUT_SIZE,
+                'version':       _VERSION,
+                'use_swa':       use_swa,
+                'severity_order': SEVERITY_ORDER,
             }, ckpt)
             print(f"✅ Saved (F1={f1:.4f}, acc={va_acc:.2f}%, bal={va_bacc:.2f}%)")
         else:
@@ -875,7 +862,7 @@ def train(data_dir, output_dir, epochs=100, batch_size=32,
                 print(f"\n⏹️  Early stopping at ep{ep+1}")
                 break
 
-    # Final SWA BN
+    # Final SWA BN update
     if USE_SWA and swa_model is not None and ep>=SWA_START:
         print("\n🔄 Final SWA BN update...")
         full_bn_update(tr_loader, swa_model, device)
@@ -883,9 +870,16 @@ def train(data_dir, output_dir, epochs=100, batch_size=32,
                                     use_tta=USE_TTA,tta_t=tta_t,verbose=True)
         print(f"  SWA final — acc={sa:.2f}% bal={sb:.2f}% F1={sf:.4f}")
         sp=os.path.join(output_dir,'swa_model.pt')
-        torch.save({'model_state_dict':swa_model.state_dict(),'class_names':cls,
-                    'num_features':NUM_FEATURES,'feat_dim':FEAT_DIM,
-                    'input_size':INPUT_SIZE,'version':_VERSION},sp)
+        torch.save({
+            'model_state_dict': swa_model.state_dict(),
+            'class_names':   cls,
+            'num_classes':   len(cls),
+            'num_features':  NUM_FEATURES,
+            'feat_dim':      FEAT_DIM,
+            'input_size':    INPUT_SIZE,
+            'version':       _VERSION,
+            'severity_order': SEVERITY_ORDER,
+        }, sp)
         print(f"  SWA saved: {sp}")
         if sf>best_f1 or sb>best_bacc:
             import shutil; shutil.copy(sp,ckpt)
@@ -905,7 +899,7 @@ def train(data_dir, output_dir, epochs=100, batch_size=32,
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data-dir',                type=str,   default='/kaggle/working/data')
+    parser.add_argument('--data-dir',                type=str,   default='/kaggle/working/data_final')
     parser.add_argument('--checkpoint-dir',          type=str,   default='./checkpoints')
     parser.add_argument('--epochs',                  type=int,   default=100)
     parser.add_argument('--batch-size',              type=int,   default=32)
@@ -927,7 +921,7 @@ if __name__ == '__main__':
     set_seed(args.seed)
 
     print(f"\n{'='*70}")
-    print(f"v10 — CIN-confusion fix + ordinal loss")
+    print(f"v11 — SIPaKMeD + Herlev | 4-class ordinal")
     print(f"{'='*70}")
     for k,v in vars(args).items():
         print(f"  {k:<30}: {v}")
