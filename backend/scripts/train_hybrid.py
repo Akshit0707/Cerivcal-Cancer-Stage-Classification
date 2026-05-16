@@ -429,7 +429,10 @@ class WarmCosine:
             prog = (e-self.warmup)/max(1,self.total-self.warmup)
             s = self.min_f + 0.5*(1-self.min_f)*(1+math.cos(math.pi*prog))
         for pg in self.opt.param_groups:
-            pg['lr'] = pg['base_lr']*s
+            if pg.get('frozen_lr', False):
+                pass  # skip — lr managed externally
+            else:
+                pg['lr'] = pg['base_lr']*s
 
     def lrs(self): return [pg['lr'] for pg in self.opt.param_groups]
 
@@ -727,7 +730,7 @@ def train(data_dir, output_dir, epochs=100, batch_size=32,
                            pin_memory=True, persistent_workers=(nw>0))
 
     # ── Model ─────────────────────────────────────────────────────────────
-    model = build_model(len(cls), NUM_FEATURES, device, dropout=0.3, dpr=0.2)
+    model = build_model(len(cls), NUM_FEATURES, device, dropout=0.5, dpr=0.4)
     freeze_backbone(model)
 
     # ── Resume from checkpoint ────────────────────────────────────────────
@@ -811,6 +814,7 @@ def train(data_dir, output_dir, epochs=100, batch_size=32,
                 else:
                     pg['lr']      = lr * 0.5
                     pg['base_lr'] = lr * 0.5
+            opt.param_groups[-1]['frozen_lr'] = True
             sch = WarmCosine(opt, warmup=2, total=epochs-ep, min_frac=0.03)
             if USE_SWA:
                 swa_model = AveragedModel(model)
