@@ -378,14 +378,15 @@ def adjacent_mixup(images, features, labels, alpha=0.1):
 
     adj      = (torch.abs(la.float()-lb.float()) <= 1).float()
     same_dom = (features[:, -1] == features[perm, -1]).float()
-    mask     = (adj * same_dom).view(-1, 1, 1, 1)
+    mask_1d  = adj * same_dom                          # (B,)
 
-    mixed_img  = mask*(lam*images + (1-lam)*images[perm]) + (1-mask)*images
-    # FIXED: use unsqueeze(1) so (B,1) broadcasts over (B,31)
-    mixed_feat = mask.unsqueeze(1)*(lam*features + (1-lam)*features[perm]) + \
-                 (1-mask.unsqueeze(1))*features
-    return mixed_img, mixed_feat, la, lb, lam, mask.squeeze()
+    img_mask  = mask_1d.view(-1, 1, 1, 1)             # (B,1,1,1)  for images
+    feat_mask = mask_1d.view(-1, 1)                    # (B,1)      for features
 
+    mixed_img  = img_mask  * (lam*images   + (1-lam)*images[perm])   + (1-img_mask) *images
+    mixed_feat = feat_mask * (lam*features + (1-lam)*features[perm]) + (1-feat_mask)*features
+
+    return mixed_img, mixed_feat, la, lb, lam, mask_1d
 
 def cutmix_fn(images, features, labels, alpha=0.1):
     B, _, H, W = images.shape
