@@ -635,7 +635,7 @@ def train(data_dir, output_dir, epochs=100, batch_size=32,
     def sample_weight(l):
         name = cls[l]
         if name == 'CIN1':    return (1./tc[l]) * 5.
-        if name in hard_idx:  return (1./tc[l]) * 3.
+        if name in HARD_CLASSES:  return (1./tc[l]) * 3.
         return 1./tc[l]
     sw = [sample_weight(l) for l in tr_l]
     sampler = WeightedRandomSampler(sw, len(tr_l), replacement=True)
@@ -688,13 +688,9 @@ def train(data_dir, output_dir, epochs=100, batch_size=32,
                 })
                 print(f"  ✅ Backbone group added (bb_lr={lr*0.005:.1e})")
 
-            # Fresh scheduler with healthy LR
-            remaining = max(60, epochs - start_epoch)
-            sch = WarmCosine(opt, warmup=2, total=remaining, min_frac=0.20)
-            for pg in opt.param_groups:
-                if not pg.get('frozen_lr', False):
-                    pg['lr']      = lr * 0.5
-                    pg['base_lr'] = lr * 0.5
+                if USE_SWA:
+                    swa_model = AveragedModel(model)
+                    print("  ✅ SWA model reset after resume")
             print(f"  ✅ Scheduler restarted, head_lr={lr*0.5:.1e}")
         else:
             print("⚠️  No checkpoint found — starting from scratch")
@@ -818,7 +814,8 @@ def train(data_dir, output_dir, epochs=100, batch_size=32,
                 print(f"\n⏹️  Early stopping at ep{ep+1}")
                 break
 
-    if USE_SWA and swa_model is not None and ep>=SWA_START:
+    last_ep = ep if start_epoch < epochs else start_epoch - 1
+    if USE_SWA and swa_model is not None and last_ep >= SWA_START:
         print("\n🔄 Final SWA BN update...")
         full_bn_update(tr_loader, swa_model, device)
         sa,sb,sl,sf,_,_ = evaluate(swa_model,va_loader,device,ce_fn,cls,
