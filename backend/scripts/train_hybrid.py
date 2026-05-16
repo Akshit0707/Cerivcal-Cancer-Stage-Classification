@@ -80,7 +80,7 @@ CE_WEIGHT       = 0.7
 SEVERITY_ORDER = ['Normal', 'CIN1', 'HighGrade', 'Cancer']
 
 # Classes that get 3x sampler weight (harder / less represented)
-HARD_CLASSES   = {'HighGrade', 'Cancer', 'Normal'}
+HARD_CLASSES   = {'HighGrade', 'Cancer', 'Normal', 'CIN1'}  # In 4-class setup, all classes are somewhat hard/imbalanced
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Path setup
@@ -793,22 +793,18 @@ def train(data_dir, output_dir, epochs=100, batch_size=32,
         if not unfrz and ep >= FREEZE_EPOCHS:
             unfrz = True
             unfreeze_progressive(model, ep, FREEZE_EPOCHS)
-            
-            # Recreate optimizer with updated backbone parameters
-            bb_ids = {id(p) for p in model.backbone.parameters()}
-            head_p = [p for p in model.parameters() if id(p) not in bb_ids]
-            back_p = list(model.backbone.parameters())
-            
-            opt = make_opt(lr * 0.01, lr)  # Recreate with unfrozen backbone
-            # Cap head LR at half original after unfreeze
+            opt.add_param_group({
+                'params': [p for p in model.backbone.parameters() if p.requires_grad],
+                'lr': lr * 0.005,
+                'weight_decay': 1e-4,
+            })
             for pg in opt.param_groups[:-1]:
                 pg['lr'] = lr * 0.5
                 pg['base_lr'] = lr * 0.5
             sch = WarmCosine(opt, warmup=2, total=epochs-ep, min_frac=0.03)
-            
             if USE_SWA:
                 swa_model = AveragedModel(model)
-            print(f"  Unfrozen backbone — recreated optimizer (bb_lr={lr*0.01:.1e})")
+            print(f"  Added backbone params to optimizer (bb_lr={lr*0.005:.1e})")
         elif unfrz and ep > FREEZE_EPOCHS:
             unfreeze_progressive(model, ep, FREEZE_EPOCHS)
 
