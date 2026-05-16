@@ -822,8 +822,8 @@ def train(data_dir, output_dir, epochs=100, batch_size=32,
         for pg in opt.param_groups:
             pg['lr']      = lr * 0.5
             pg['base_lr'] = lr * 0.5
-        sch.ep = start_epoch
-        print(f"  ✅ LR reset to {lr*0.5:.1e} for resume at epoch {start_epoch}")
+        sch = WarmCosine(opt, warmup=3, total=max(40, epochs - start_epoch), min_frac=0.15)
+        print(f"  ✅ LR reset to {lr*0.5:.1e}, scheduler restarted for resume at epoch {start_epoch}")
 
     pat=0; unfrz=False
     ckpt = os.path.join(output_dir, 'best_model.pt')
