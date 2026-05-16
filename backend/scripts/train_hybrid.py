@@ -793,15 +793,20 @@ def train(data_dir, output_dir, epochs=100, batch_size=32,
         if not unfrz and ep >= FREEZE_EPOCHS:
             unfrz = True
             unfreeze_progressive(model, ep, FREEZE_EPOCHS)
-            opt.add_param_group({
-                'params': back_p,
-                'lr': lr * 0.005,
-                'weight_decay': 1e-4,
-            })
+            # Collect params not already in optimizer
+            existing = {id(p) for group in opt.param_groups for p in group['params']}
+            new_bb_params = [p for p in model.backbone.parameters()
+                             if p.requires_grad and id(p) not in existing]
+            if new_bb_params:
+                opt.add_param_group({
+                    'params': new_bb_params,
+                    'lr': lr * 0.005,
+                    'weight_decay': 1e-4,
+                })
+                opt.param_groups[-1]['base_lr'] = lr * 0.005
             for pg in opt.param_groups[:-1]:
                 pg['lr'] = lr * 0.5
                 pg['base_lr'] = lr * 0.5
-            opt.param_groups[-1]['base_lr'] = lr * 0.005
             sch = WarmCosine(opt, warmup=2, total=epochs-ep, min_frac=0.03)
             if USE_SWA:
                 swa_model = AveragedModel(model)
