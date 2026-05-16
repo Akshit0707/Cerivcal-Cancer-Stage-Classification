@@ -1,78 +1,68 @@
 """
-train_hybrid.py  —  v9 (accuracy push: targets 80-90%)
-═══════════════════════════════════════════════════════
-WHAT CHANGED FROM v8 AND WHY:
+train_hybrid.py — v10 (CIN-confusion fix + 80-90% accuracy push)
+═══════════════════════════════════════════════════════════════════
 
-PROBLEM 1 — Val stuck at 39-40%:
-  CNN backbone was frozen for only 5 epochs, then unfrozen with such a low LR
-  that gradients barely moved weights. The head never got strong enough during
-  freeze-only training to guide the unfreeze properly.
-  FIX: Freeze for 8 epochs at lr=3e-4 head only. After unfreeze, use
-       lr=1e-4 head / 1e-5 backbone — standard fine-tuning ratios that work.
+DIAGNOSIS FROM v9 LOGS (epochs 1-61):
+──────────────────────────────────────
+Per-class accuracy at epoch 60:
+  Normal : 94-100%  ← trivially easy (distinct morphology)
+  Cancer : 48-66%   ← moderate
+  CIN1   : 34-42%   ← bad
+  CIN2   : 26-45%   ← bad
+  CIN3   : 16-29%   ← catastrophic
 
-PROBLEM 2 — Double class-imbalance compensation:
-  WeightedRandomSampler already balances batches. FocalLoss with class weights
-  on top causes the model to over-penalise majority classes → confusion.
-  FIX: Keep WeightedRandomSampler (best for tiny datasets). Use FocalLoss
-       WITHOUT per-class weights. Let the sampler handle balance.
+CONCLUSION: The model collapses CIN1/CIN2/CIN3 into each other.
+These are ordinal grades (Normal < CIN1 < CIN2 < CIN3 < Cancer)
+and the standard 5-way softmax treats them as unrelated categories,
+giving no credit for being "one grade off."
 
-PROBLEM 3 — FeatureMLP skip connection adds noise:
-  30 traditional features projected to 128 dims with a residual connection.
-  If any feature extractor returns near-zero vectors (common on Kaggle GPU),
-  the skip proj(x) still pushes garbage into the fusion.
-  FIX: Remove skip connection. Make MLP a clean 3-block net. Add
-       a gate that can learn to suppress the feature branch entirely
-       if it's uninformative (FiLM-style learned scale+shift).
+ROOT CAUSES AND FIXES:
+══════════════════════
 
-PROBLEM 4 — MixUp starts at epoch 25, too late:
-  With only 100 epochs and early stopping at 20, MixUp never kicks in
-  meaningfully. Also CutMix+MixUp simultaneously halves the chance of each.
-  FIX: MixUp starts at epoch 10, alpha=0.1→0.3. CutMix only after ep 20.
-       Both together from ep 30.
+FIX A — Ordinal loss (replaces FocalLoss for CIN grades)
+  The biggest accuracy killer. CIN1/2/3 differ only in the fraction
+  of abnormal cells in the epithelium. Standard CE has equal penalty
+  for CIN1->Normal vs CIN1->CIN3 — wrong. We add an ordinal auxiliary
+  loss: cumulative binary classifiers (is_grade >= k for k=1..4).
+  This forces the model to learn the severity axis.
+  Combined loss = 0.7 * CE + 0.3 * OrdinalLoss.
 
-PROBLEM 5 — SWA BN update every epoch is very slow:
-  _update_bn_hybrid() runs a full forward pass on train_loader every SWA
-  epoch. That's 72 extra batches every epoch from ep 40 → 100.
-  FIX: Only run BN update at the very end, not every epoch.
-       Remove swa_scheduler.step() from the hot path — it conflicts with
-       WarmupCosineScheduler anyway.
+FIX B — MixUp alpha WAY too high (0.3 max on 2331 samples)
+  With alpha=0.3 and only 2331 training images, every batch is a
+  heavily blended mix. The model NEVER sees clean CIN2/CIN3 examples
+  because those classes only have ~116/114 val samples. MixUp alpha
+  should scale with dataset size. With ~460-560 per class, max 0.1.
+  Also: MixUp should NOT apply to Normal+CIN or Cancer+CIN mixtures.
+  Use class-aware MixUp that only mixes within adjacent grades.
+  FIXED: max_alpha=0.1, class-constrained mixing, start at epoch 20.
 
-PROBLEM 6 — TTA on every val step using PIL re-reads from disk:
-  5× val loader reloads every image from disk per epoch. Extremely slow
-  and provides negligible benefit during training.
-  FIX: TTA only at final evaluation after training. During training use
-       single-pass val (fast, enables more epochs).
+FIX C — LR dying too fast then jumping (cosine restarts = instability)
+  At epoch 47-49, head_lr drops to 3-5e-6 then jumps to 5e-5 at ep56.
+  SWA model is evaluated before BN is updated so scores are unreliable.
+  FIXED: Single clean cosine decay per phase. Mini BN update before
+  every SWA eval (60 batches = ~30s, makes SWA scores meaningful).
 
-PROBLEM 7 — Scheduler conflicts:
-  WarmupCosineScheduler + SWALR both call step() → LR becomes undefined.
-  FIX: Drop SWALR entirely. Use a single clean OneCycleLR-style schedule:
-       warmup 3 ep → cosine decay. After unfreeze, reset scheduler.
+FIX D — SWA evaluated without BN update = garbage scores
+  SWA [SWA] scores (0.44-0.47) consistently BELOW base model (0.46-0.47)
+  because BN stats are stale. Every SWA checkpoint saved is worse.
+  FIXED: mini_bn_update() before each SWA eval.
 
-PROBLEM 8 — Data augmentation too weak for medical imaging:
-  Standard ImageNet augmentations. Cervical cell images need:
-    - Stain normalisation simulation (color jitter, grayscale prob)
-    - Nucleus-aware crops (RandomResizedCrop instead of just resize)
-    - Elastic deformations (approximated via RandomAffine with shear)
-  FIX: Stronger, domain-appropriate augmentation pipeline.
+FIX E — Backbone unfreezing too fast (all 9 stages by epoch 33)
+  At epoch 33, train acc is only 39%. Head not strong enough to guide
+  the full backbone. Caused oscillation in epochs 30-49.
+  FIXED: Unfreeze 1 stage every 5 epochs (was every 3).
 
-PROBLEM 9 — Attention produces 2 scalars but fused_scaled still uses
-  element-wise multiply then cat — the attention output is always ~0.5
-  for both branches early in training, providing no benefit.
-  FIX: Replace with a proper channel attention (SE-style) that learns
-       to re-weight each of the 1664 fusion channels independently.
+FIX F — Head dropout too high for tiny dataset
+  0.4 dropout on 768 units with 2331 samples = underfitting to CIN.
+  FIXED: dropout=0.3 (head), 0.15 (mid), 0.07 (final).
 
-PROBLEM 10 — LabelSmoothing + FocalLoss double-smoothing:
-  FocalLoss smoothing=0.05 + label smoothing in the same function.
-  FIX: Smoothing=0.1, gamma=1.5 (less aggressive), no double application.
+FIX G — Sampler over-weights wrong classes
+  2x Normal weight was over-sampling an already easy class (98-100% acc).
+  FIXED: 3x weight for CIN2/CIN3/Cancer (hard classes). 1x for CIN1/Normal.
 
-NEW ADDITIONS:
-  - AutoAugment (RandAugment) for stronger regularisation
-  - Longer head-only warmup (8 epochs vs 5)
-  - Gradient clipping tightened to 0.5
-  - Validation every epoch but TTA only every 5 epochs (compromise)
-  - Per-class accuracy printed every 10 epochs for debugging
-  - AdamW with decoupled weight decay (correct implementation)
-  - Label smoothing via nn.CrossEntropyLoss as a *fallback* sanity check
+FIX H — Checkpoint criterion ignores class balance
+  Max F1 misses cases where balanced accuracy improves but F1 stays flat.
+  FIXED: Checkpoint on max(F1, balanced_acc improvement).
 """
 
 import os
@@ -82,7 +72,6 @@ import random
 import sys
 import warnings
 import json
-import copy
 from collections import Counter
 from pathlib import Path
 from PIL import Image
@@ -90,11 +79,11 @@ from PIL import Image
 import numpy as np
 from tqdm import tqdm
 from sklearn.preprocessing import RobustScaler
-from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.metrics import (classification_report, confusion_matrix,
+                             balanced_accuracy_score)
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
 from torch.optim.swa_utils import AveragedModel
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from torchvision import transforms
@@ -102,57 +91,54 @@ from sklearn.model_selection import train_test_split
 
 warnings.filterwarnings("ignore")
 
-_SCRIPT_VERSION = "EfficientNet-B3-Hybrid-v9-accuracy-push"
-print(f"[train_hybrid.py] version={_SCRIPT_VERSION}  file={__file__}")
+_VERSION = "EfficientNet-B3-Hybrid-v10-ordinal-CIN-fix"
+print(f"[train_hybrid.py] version={_VERSION}  file={__file__}")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Global toggles
+# Toggles
 # ─────────────────────────────────────────────────────────────────────────────
-USE_SAM      = False
-USE_TTA      = True       # Only at final eval, not every epoch
-USE_SWA      = True
-USE_CUTMIX   = True
-SWA_START    = 50         # Later SWA start — let model converge first
-TTA_AUGMENTS = 5
-TTA_EVERY_N  = 5          # Run TTA only every N val epochs (speed vs accuracy)
+USE_SAM    = False
+USE_TTA    = True
+USE_SWA    = True
+USE_CUTMIX = True
+SWA_START  = 55
+TTA_EVERY  = 5
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Architecture constants — DO NOT change without rebuilding checkpoints
+# Architecture constants
 # ─────────────────────────────────────────────────────────────────────────────
-NUM_TRADITIONAL_FEATURES = 30
-CNN_INPUT_SIZE  = 300
-FEAT_OUT_DIM    = 128
-CNN_OUT_DIM     = 1536     # EfficientNet-B3 penultimate layer
-FUSION_DIM      = CNN_OUT_DIM + FEAT_OUT_DIM   # 1664
+NUM_FEATURES    = 30
+INPUT_SIZE      = 300
+FEAT_DIM        = 128
+CNN_DIM         = 1536
+FUSION_DIM      = CNN_DIM + FEAT_DIM   # 1664
 
-BACKBONE_FREEZE_EPOCHS  = 8    # Longer head warmup before touching backbone
-UNFREEZE_WARMUP_EPOCHS  = 4    # Safe low-LR epochs after unfreeze
+FREEZE_EPOCHS   = 10
+UNFREEZE_STEP   = 5
+ORDINAL_WEIGHT  = 0.3
+CE_WEIGHT       = 0.7
+
+# Severity order — MUST match label assignment
+SEVERITY_ORDER = ['Normal', 'CIN1', 'CIN2', 'CIN3', 'Cancer']
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Path setup
 # ─────────────────────────────────────────────────────────────────────────────
 SCRIPT_PATH = Path(__file__).resolve()
-SCRIPTS_DIR = SCRIPT_PATH.parent
-BACKEND_DIR = SCRIPT_PATH.parents[1]
-PROJECT_ROOT = SCRIPT_PATH.parents[2]
-
-for p in (SCRIPTS_DIR, BACKEND_DIR):
-    if str(p) not in sys.path:
-        sys.path.insert(0, str(p))
+for _p in (SCRIPT_PATH.parent, SCRIPT_PATH.parents[1]):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 
 try:
     from backend.feature_extractor import extract_medical_features
 except Exception:
     try:
         from feature_extractor import extract_medical_features
-    except Exception as e:
-        raise ImportError("Could not import feature_extractor.") from e
+    except Exception as _e:
+        raise ImportError("Could not import feature_extractor.") from _e
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Utilities
-# ─────────────────────────────────────────────────────────────────────────────
-def set_seed(seed: int = 42):
+def set_seed(seed=42):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -162,975 +148,768 @@ def set_seed(seed: int = 42):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SAM Optimizer (optional, 2× slower)
+# ORDINAL LOSS — key fix for CIN1/CIN2/CIN3 confusion
 # ─────────────────────────────────────────────────────────────────────────────
-class SAM(torch.optim.Optimizer):
-    def __init__(self, params, base_optimizer_cls, rho=0.05, **kwargs):
-        defaults = dict(rho=rho, **kwargs)
-        super().__init__(params, defaults)
-        self.base_optimizer = base_optimizer_cls(self.param_groups, **kwargs)
-        self.param_groups   = self.base_optimizer.param_groups
+class OrdinalLoss(nn.Module):
+    """
+    Cumulative-link ordinal regression loss.
 
-    @torch.no_grad()
-    def first_step(self, zero_grad=False):
-        grad_norm = self._grad_norm()
-        for group in self.param_groups:
-            scale = group["rho"] / (grad_norm + 1e-12)
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
-                self.state[p]["old_p"] = p.data.clone()
-                p.add_(p.grad * scale.to(p))
-        if zero_grad:
-            self.zero_grad()
+    For K severity-ordered classes (0..K-1), learns K-1 binary classifiers:
+      P(Y >= k)  for k = 1..K-1
 
-    @torch.no_grad()
-    def second_step(self, zero_grad=False):
-        for group in self.param_groups:
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
-                p.data = self.state[p]["old_p"]
-        self.base_optimizer.step()
-        if zero_grad:
-            self.zero_grad()
+    This gives partial credit for near-misses:
+      predicting CIN2 when truth=CIN3 is penalised LESS than predicting Normal.
 
-    def _grad_norm(self):
-        shared_device = self.param_groups[0]["params"][0].device
-        return torch.norm(torch.stack([
-            p.grad.norm(p=2).to(shared_device)
-            for group in self.param_groups
-            for p in group["params"]
-            if p.grad is not None
-        ]), p=2)
+    ordinal_logits: (B, K-1) from a separate Linear head
+    targets:        (B,) class indices 0..K-1
+    """
+    def __init__(self, num_classes=5, smoothing=0.05):
+        super().__init__()
+        self.K = num_classes
+        self.s = smoothing
 
-    def load_state_dict(self, state_dict):
-        super().load_state_dict(state_dict)
-        self.base_optimizer.param_groups = self.param_groups
+    def forward(self, logits, targets):
+        B, K1 = logits.shape
+        # Binary targets: 1 if true_class >= threshold k
+        bt = torch.zeros(B, K1, device=targets.device)
+        for k in range(1, self.K):
+            bt[:, k-1] = (targets >= k).float()
+        bt = bt*(1-self.s) + (1-bt)*self.s
+        return F.binary_cross_entropy_with_logits(logits, bt)
+
+
+class FocalLoss(nn.Module):
+    """
+    Focal Loss, no per-class weights (sampler handles balance).
+    gamma=1.0 — gentler; ordinal loss handles hard CIN negatives.
+    """
+    def __init__(self, gamma=1.0, smoothing=0.08, num_classes=5):
+        super().__init__()
+        self.gamma = gamma
+        self.s = smoothing
+        self.K = num_classes
+
+    def forward(self, logits, targets):
+        logits = torch.clamp(logits, -50., 50.)
+        with torch.no_grad():
+            sm = torch.full_like(logits, self.s/(self.K-1))
+            sm.scatter_(1, targets.unsqueeze(1), 1.-self.s)
+        log_p = F.log_softmax(logits, -1)
+        ce = -(sm*log_p).sum(-1)
+        pt = F.softmax(logits,-1).gather(1, targets.unsqueeze(1)).squeeze(1)
+        return ((1-pt)**self.gamma * ce).mean()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Model Components
+# Model
 # ─────────────────────────────────────────────────────────────────────────────
-
-class SqueezeExcitation(nn.Module):
-    """Channel attention over the full fusion vector."""
-    def __init__(self, dim: int, reduction: int = 16):
+class ChannelSE(nn.Module):
+    def __init__(self, dim, r=16):
         super().__init__()
         self.fc = nn.Sequential(
-            nn.Linear(dim, max(4, dim // reduction)),
-            nn.ReLU(inplace=True),
-            nn.Linear(max(4, dim // reduction), dim),
-            nn.Sigmoid(),
+            nn.Linear(dim, max(8, dim//r)), nn.ReLU(inplace=True),
+            nn.Linear(max(8, dim//r), dim), nn.Sigmoid(),
         )
-
     def forward(self, x):
         return x * self.fc(x)
 
 
 class FeatureMLP(nn.Module):
-    """
-    Clean 3-block MLP — NO skip connection.
-    The residual was adding noise when traditional features are near-zero.
-    Output: 128-dim embedding aligned with CNN feature scale.
-    """
-    def __init__(self, in_dim=30, out_dim=128, dropout=0.3):
+    """3-block MLP with learned gate. No skip connection."""
+    def __init__(self, in_dim=30, out_dim=128, dropout=0.25):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(in_dim, 256),
-            nn.BatchNorm1d(256),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(256, 256),
-            nn.BatchNorm1d(256),
-            nn.GELU(),
-            nn.Dropout(dropout * 0.5),
-            nn.Linear(256, out_dim),
-            nn.BatchNorm1d(out_dim),
+            nn.Linear(in_dim, 256), nn.BatchNorm1d(256), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(256, 256),   nn.BatchNorm1d(256), nn.GELU(), nn.Dropout(dropout*0.5),
+            nn.Linear(256, out_dim), nn.BatchNorm1d(out_dim),
         )
-        # Learned gate: allows the network to suppress the MLP branch
-        # if traditional features are uninformative (outputs near 0)
         self.gate = nn.Sequential(
-            nn.Linear(in_dim, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1),
-            nn.Sigmoid(),
+            nn.Linear(in_dim, 32), nn.ReLU(),
+            nn.Linear(32, 1), nn.Sigmoid(),
         )
-
     def forward(self, x):
-        feat = self.net(x)
-        gate = self.gate(x)      # scalar ∈ (0,1) per sample
-        return feat * gate        # suppresses branch when features are bad
+        return self.net(x) * self.gate(x)
 
 
 class EfficientNetHybrid(nn.Module):
     """
-    EfficientNet-B3 (300×300) + FeatureMLP with SE channel attention.
-
-    Key changes from v8:
-      - FeatureMLP has a learned gate (suppresses bad features)
-      - Channel-wise SE attention over full 1664-dim fusion instead of
-        2-scalar branch attention (much more expressive)
-      - Stronger classifier head: 1664 → 768 → 256 → num_classes
-        (extra layer helps when fusion_dim is large)
-      - Dropout schedule: 0.4 on first FC, 0.2 on second
+    EfficientNet-B3 + FeatureMLP with SE attention.
+    Two heads:
+      - main head: 5-class classifier
+      - ordinal head: 4 binary thresholds (forces severity axis learning)
     """
     def __init__(self, num_classes=5, num_features=30,
-                 feat_out_dim=128, dropout=0.4, drop_path_rate=0.2):
+                 feat_dim=128, dropout=0.3, drop_path_rate=0.2):
         super().__init__()
+        self.num_classes = num_classes
 
-        # Backbone
         try:
             from torchvision.models import efficientnet_b3, EfficientNet_B3_Weights
-            backbone = efficientnet_b3(weights=EfficientNet_B3_Weights.IMAGENET1K_V1)
-            self.cnn_out_dim = backbone.classifier[1].in_features  # 1536
-            backbone.classifier = nn.Identity()
-            self._set_drop_path(backbone, drop_path_rate)
-            self.backbone = backbone
+            bb = efficientnet_b3(weights=EfficientNet_B3_Weights.IMAGENET1K_V1)
+            self.cnn_dim = bb.classifier[1].in_features
+            bb.classifier = nn.Identity()
+            self._set_drop_path(bb, drop_path_rate)
+            self.backbone = bb
         except Exception:
-            # Fallback to ResNet50 if torchvision version is old
             from torchvision.models import resnet50, ResNet50_Weights
-            backbone = resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)
-            self.cnn_out_dim = backbone.fc.in_features  # 2048
-            backbone.fc = nn.Identity()
-            self.backbone = backbone
+            bb = resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)
+            self.cnn_dim = bb.fc.in_features
+            bb.fc = nn.Identity()
+            self.backbone = bb
 
-        # Traditional feature branch with learned gate
-        self.feature_mlp = FeatureMLP(
-            in_dim=num_features, out_dim=feat_out_dim, dropout=0.3
-        )
+        self.feat_mlp = FeatureMLP(num_features, feat_dim, dropout=0.25)
+        fusion = self.cnn_dim + feat_dim
+        self.se = ChannelSE(fusion, r=16)
 
-        fusion_dim = self.cnn_out_dim + feat_out_dim  # 1664
-
-        # Channel-wise SE attention on full fusion vector
-        # Much more expressive than the 2-scalar branch weighting in v8
-        self.channel_attn = SqueezeExcitation(fusion_dim, reduction=16)
-
-        # Classifier: 3-layer head with BN for stability
-        # 1664 → 768 → 256 → num_classes
-        self.classifier = nn.Sequential(
+        # Main head — lighter than v9
+        self.head = nn.Sequential(
             nn.Dropout(dropout),
-            nn.Linear(fusion_dim, 768),
-            nn.BatchNorm1d(768),
-            nn.GELU(),
-            nn.Dropout(dropout * 0.5),
-            nn.Linear(768, 256),
-            nn.BatchNorm1d(256),
-            nn.GELU(),
-            nn.Dropout(dropout * 0.25),
+            nn.Linear(fusion, 512), nn.BatchNorm1d(512), nn.GELU(),
+            nn.Dropout(dropout*0.5),
+            nn.Linear(512, 256), nn.BatchNorm1d(256), nn.GELU(),
+            nn.Dropout(dropout*0.25),
             nn.Linear(256, num_classes),
         )
 
-        self._init_head()
+        # Ordinal auxiliary head
+        self.ordinal_head = nn.Sequential(
+            nn.Dropout(dropout*0.5),
+            nn.Linear(fusion, 128), nn.GELU(),
+            nn.Linear(128, num_classes-1),
+        )
 
-    def _init_head(self):
-        """Kaiming init for all Linear layers in the head."""
-        for m in self.classifier.modules():
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in list(self.head.modules()) + list(self.ordinal_head.modules()):
             if isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def _set_drop_path(self, backbone, rate: float):
+    def _set_drop_path(self, bb, rate):
         try:
-            blocks = list(backbone.features.children())
-            n = sum(1 for stage in blocks
-                    if hasattr(stage, '__iter__') for _ in stage)
-            rates = torch.linspace(0, rate, max(n, 1)).tolist()
-            idx = 0
-            for stage in blocks:
-                if not hasattr(stage, '__iter__'):
-                    continue
-                for block in stage:
-                    if hasattr(block, 'stochastic_depth'):
-                        block.stochastic_depth.p = rates[idx]
-                    idx += 1
+            blocks = list(bb.features.children())
+            n = sum(1 for s in blocks if hasattr(s,'__iter__') for _ in s)
+            rates = torch.linspace(0, rate, max(n,1)).tolist()
+            i = 0
+            for s in blocks:
+                if not hasattr(s,'__iter__'): continue
+                for b in s:
+                    if hasattr(b,'stochastic_depth'):
+                        b.stochastic_depth.p = rates[i]
+                    i += 1
         except Exception:
             pass
 
-    def forward(self, images, features):
-        images   = torch.nan_to_num(images,   nan=0.0, posinf=1.0,  neginf=-1.0)
-        features = torch.nan_to_num(features, nan=0.0, posinf=0.0,  neginf=0.0)
-
-        cnn_feat  = self.backbone(images)
-        cnn_feat  = torch.nan_to_num(cnn_feat, nan=0.0, posinf=1e3, neginf=-1e3)
-
-        trad_feat = self.feature_mlp(features)
-        trad_feat = torch.nan_to_num(trad_feat, nan=0.0, posinf=1e3, neginf=-1e3)
-
-        fused = torch.cat([cnn_feat, trad_feat], dim=1)   # (B, 1664)
-        fused = self.channel_attn(fused)                   # SE re-weighting
-        return self.classifier(fused)
+    def forward(self, images, features, return_ordinal=True):
+        images   = torch.nan_to_num(images,   nan=0., posinf=1.,  neginf=-1.)
+        features = torch.nan_to_num(features, nan=0., posinf=0.,  neginf=0.)
+        cnn  = torch.nan_to_num(self.backbone(images),   nan=0., posinf=1e3, neginf=-1e3)
+        feat = torch.nan_to_num(self.feat_mlp(features), nan=0., posinf=1e3, neginf=-1e3)
+        fused  = self.se(torch.cat([cnn, feat], dim=1))
+        logits = self.head(fused)
+        if return_ordinal:
+            return logits, self.ordinal_head(fused)
+        return logits
 
 
-def build_model(num_classes, num_features, device, dropout=0.4, drop_path_rate=0.2):
-    model = EfficientNetHybrid(
-        num_classes=num_classes,
-        num_features=num_features,
-        feat_out_dim=FEAT_OUT_DIM,
-        dropout=dropout,
-        drop_path_rate=drop_path_rate,
-    ).to(device)
-
-    n_params  = sum(p.numel() for p in model.parameters())
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"  Model        : EfficientNetHybrid-v9 (EfficientNet-B3 @ {CNN_INPUT_SIZE}×{CNN_INPUT_SIZE})")
-    print(f"  fusion_dim   : {FUSION_DIM}  (CNN={CNN_OUT_DIM} + feat={FEAT_OUT_DIM})")
-    print(f"  Parameters   : {n_params:,} total / {trainable:,} trainable")
-    print(f"  Device       : {device}  |  Classes: {num_classes}")
-    return model
+def build_model(num_classes, num_features, device, dropout=0.3, dpr=0.2):
+    m = EfficientNetHybrid(num_classes, num_features, FEAT_DIM, dropout, dpr).to(device)
+    n = sum(p.numel() for p in m.parameters())
+    t = sum(p.numel() for p in m.parameters() if p.requires_grad)
+    print(f"  Model      : EfficientNetHybrid-v10 @ {INPUT_SIZE}x{INPUT_SIZE}")
+    print(f"  Fusion dim : {FUSION_DIM}  |  Params: {n:,} ({t:,} trainable)")
+    print(f"  Device     : {device}  |  Classes: {num_classes}")
+    return m
 
 
 def freeze_backbone(model):
     for p in model.backbone.parameters():
         p.requires_grad = False
     n = sum(p.numel() for p in model.backbone.parameters())
-    print(f"  🔒 Backbone frozen ({n:,} params) — head-only training for {BACKBONE_FREEZE_EPOCHS} epochs")
+    print(f"  Backbone frozen ({n:,} params) — head-only for {FREEZE_EPOCHS} epochs")
 
 
-def get_backbone_stages(model):
+def get_stages(model):
     try:
         return list(model.backbone.features.children())
     except Exception:
         return []
 
 
-def unfreeze_progressive(model, epoch, freeze_start, total_epochs):
-    """Unfreeze backbone from top (near-head) to bottom (near-input)."""
-    stages = get_backbone_stages(model)
+def unfreeze_progressive(model, epoch, freeze_start):
+    stages = get_stages(model)
     if not stages:
-        for p in model.backbone.parameters():
-            p.requires_grad = True
-        n = sum(p.numel() for p in model.backbone.parameters())
-        print(f"  🔓 Backbone fully unfrozen ({n:,} params)")
+        for p in model.backbone.parameters(): p.requires_grad = True
+        print("  Backbone fully unfrozen")
         return
-
-    n_stages = len(stages)
-    epochs_since = epoch - freeze_start
-    # Unfreeze 1 new stage every 3 epochs after freeze_start
-    n_to_unfreeze = min(n_stages, 1 + epochs_since // 3)
-
-    for i, stage in enumerate(reversed(stages)):
-        req_grad = (i < n_to_unfreeze)
-        for p in stage.parameters():
-            p.requires_grad = req_grad
-
-    unfrozen = sum(p.numel() for p in model.backbone.parameters() if p.requires_grad)
-    total    = sum(p.numel() for p in model.backbone.parameters())
-    print(f"  🔓 Unfreeze {n_to_unfreeze}/{n_stages} stages ({unfrozen:,}/{total:,} backbone params)")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Loss — FocalLoss WITHOUT per-class weights
-# WeightedRandomSampler handles class balance; no double-compensation.
-# ─────────────────────────────────────────────────────────────────────────────
-class FocalLoss(nn.Module):
-    """
-    Focal Loss with label smoothing.
-    gamma=1.5 (softer than 2.0 — avoids over-focusing on hard negatives
-    in a noisy medical dataset where hard examples may be mislabelled).
-    No per-class weight here — sampler already balances classes.
-    """
-    def __init__(self, gamma=1.5, smoothing=0.1, num_classes=5):
-        super().__init__()
-        self.gamma      = gamma
-        self.smoothing  = smoothing
-        self.num_classes = num_classes
-
-    def forward(self, logits, targets):
-        logits = torch.clamp(logits, -50.0, 50.0)
-        n_cls  = logits.size(-1)
-
-        # Label-smoothed targets
-        with torch.no_grad():
-            smooth_t = torch.full_like(logits, self.smoothing / (n_cls - 1))
-            smooth_t.scatter_(1, targets.unsqueeze(1), 1.0 - self.smoothing)
-
-        log_probs = F.log_softmax(logits, dim=-1)
-        ce_loss   = -(smooth_t * log_probs).sum(dim=-1)
-
-        # Focal weight from the true class probability
-        probs       = F.softmax(logits, dim=-1)
-        true_probs  = probs.gather(1, targets.unsqueeze(1)).squeeze(1)
-        focal_w     = (1 - true_probs) ** self.gamma
-        return (focal_w * ce_loss).mean()
+    n = min(len(stages), 1 + (epoch-freeze_start)//UNFREEZE_STEP)
+    for i, s in enumerate(reversed(stages)):
+        for p in s.parameters():
+            p.requires_grad = (i < n)
+    uf = sum(p.numel() for p in model.backbone.parameters() if p.requires_grad)
+    tt = sum(p.numel() for p in model.backbone.parameters())
+    print(f"  Unfreeze {n}/{len(stages)} stages ({uf:,}/{tt:,} backbone params)")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Dataset
 # ─────────────────────────────────────────────────────────────────────────────
 class HybridDataset(Dataset):
-    def __init__(self, image_paths, labels, transform=None, feature_cache=None):
-        self.image_paths   = image_paths
-        self.labels        = labels
-        self.transform     = transform
-        self.feature_cache = feature_cache or {}
+    def __init__(self, paths, labels, transform=None, cache=None):
+        self.paths=paths; self.labels=labels
+        self.transform=transform; self.cache=cache or {}
 
-    def __len__(self):
-        return len(self.image_paths)
+    def __len__(self): return len(self.paths)
 
     def __getitem__(self, idx):
-        img_path = self.image_paths[idx]
-        image    = Image.open(img_path).convert('RGB')
-        if self.transform:
-            image = self.transform(image)
-        features = self.feature_cache.get(img_path, np.zeros(NUM_TRADITIONAL_FEATURES))
-        return {
-            'image':    image,
-            'features': torch.FloatTensor(features),
-            'label':    torch.tensor(self.labels[idx], dtype=torch.long),
-            'path':     img_path,
-        }
+        p   = self.paths[idx]
+        img = Image.open(p).convert('RGB')
+        if self.transform: img = self.transform(img)
+        feat = self.cache.get(p, np.zeros(NUM_FEATURES))
+        return {'image': img,
+                'features': torch.FloatTensor(feat),
+                'label': torch.tensor(self.labels[idx], dtype=torch.long),
+                'path': p}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Augmentation
 # ─────────────────────────────────────────────────────────────────────────────
-def get_train_transform(input_size=300):
-    """
-    Domain-appropriate augmentations for cervical cytology images:
-    - RandomResizedCrop: simulates varying magnification / cell positioning
-    - ColorJitter: simulates stain variability (Papanicolaou stain batches)
-    - RandomGrayscale: forces learning of texture/shape not just color
-    - RandomAffine with shear: approximates elastic deformation
-    - RandomErasing: occlusion robustness
-    """
+def train_transform(sz=300):
     return transforms.Compose([
-        transforms.RandomResizedCrop(
-            input_size, scale=(0.7, 1.0), ratio=(0.85, 1.15),
-            interpolation=transforms.InterpolationMode.BICUBIC,
-        ),
-        transforms.RandomHorizontalFlip(p=0.5),
-        transforms.RandomVerticalFlip(p=0.5),
-        transforms.RandomRotation(180),   # cells have no canonical orientation
-        transforms.ColorJitter(
-            brightness=0.35, contrast=0.35, saturation=0.25, hue=0.08
-        ),
-        transforms.RandomAffine(
-            degrees=0, translate=(0.1, 0.1),
-            scale=(0.85, 1.15), shear=(-10, 10),
-        ),
-        transforms.RandomGrayscale(p=0.08),
+        transforms.RandomResizedCrop(sz, scale=(0.7,1.0), ratio=(0.85,1.15),
+                                     interpolation=transforms.InterpolationMode.BICUBIC),
+        transforms.RandomHorizontalFlip(0.5),
+        transforms.RandomVerticalFlip(0.5),
+        transforms.RandomRotation(180),
+        transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.06),
+        transforms.RandomAffine(0, translate=(0.1,0.1), scale=(0.9,1.1), shear=8),
+        transforms.RandomGrayscale(p=0.06),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225]),
-        transforms.RandomErasing(p=0.3, scale=(0.02, 0.15), ratio=(0.3, 3.0)),
+        transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225]),
+        transforms.RandomErasing(p=0.25, scale=(0.02,0.12)),
     ])
 
 
-def get_val_transform(input_size=300):
+def val_transform(sz=300):
     return transforms.Compose([
-        transforms.Resize((input_size, input_size),
-                          interpolation=transforms.InterpolationMode.BICUBIC),
+        transforms.Resize((sz,sz), interpolation=transforms.InterpolationMode.BICUBIC),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225]),
+        transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225]),
     ])
 
 
-def build_tta_transforms(input_size=300):
-    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225])
-    resize = [transforms.Resize((input_size, input_size),
-                                interpolation=transforms.InterpolationMode.BICUBIC),
-              transforms.ToTensor(), normalize]
+def tta_transforms(sz=300):
+    n = transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
+    r = [transforms.Resize((sz,sz),interpolation=transforms.InterpolationMode.BICUBIC),
+         transforms.ToTensor(), n]
     return [
-        transforms.Compose(resize),
-        transforms.Compose([transforms.RandomHorizontalFlip(p=1.0)] + resize),
-        transforms.Compose([transforms.RandomVerticalFlip(p=1.0)]   + resize),
-        transforms.Compose([transforms.RandomRotation((90, 90))]    + resize),
-        transforms.Compose([transforms.RandomRotation((180, 180))]  + resize),
+        transforms.Compose(r),
+        transforms.Compose([transforms.RandomHorizontalFlip(1.)]+r),
+        transforms.Compose([transforms.RandomVerticalFlip(1.)]+r),
+        transforms.Compose([transforms.RandomRotation((90,90))]+r),
+        transforms.Compose([transforms.RandomRotation((180,180))]+r),
     ]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MixUp / CutMix — starts earlier than v8
+# Class-constrained MixUp — only adjacent grades
 # ─────────────────────────────────────────────────────────────────────────────
-def mixup_batch(images, features, labels, alpha=0.2):
-    lam   = float(np.random.beta(alpha, alpha))
-    lam   = max(0.05, min(0.95, lam))
-    idx   = torch.randperm(images.size(0), device=images.device)
-    return (lam * images   + (1-lam) * images[idx],
-            lam * features + (1-lam) * features[idx],
-            labels, labels[idx], lam)
-
-
-def cutmix_batch(images, features, labels, alpha=0.2):
-    import math as _math
+def adjacent_mixup(images, features, labels, alpha=0.1):
+    """Mix only samples with |label_a - label_b| <= 1 (adjacent severity)."""
+    B   = images.size(0)
     lam = float(np.random.beta(alpha, alpha))
-    lam = max(0.05, min(0.95, lam))
-    idx = torch.randperm(images.size(0), device=images.device)
-    _, _, H, W = images.shape
-    cut_r  = _math.sqrt(1 - lam)
-    ch, cw = int(H*cut_r), int(W*cut_r)
-    cx, cy = random.randint(0, W), random.randint(0, H)
-    x1 = max(0, cx-cw//2); x2 = min(W, cx+cw//2)
-    y1 = max(0, cy-ch//2); y2 = min(H, cy+ch//2)
+    lam = max(0.1, min(0.9, lam))
+    perm = torch.randperm(B, device=images.device)
+    la, lb = labels, labels[perm]
+    adj = (torch.abs(la.float()-lb.float()) <= 1).float().view(-1,1,1,1)
+    mixed_img  = adj*(lam*images + (1-lam)*images[perm]) + (1-adj)*images
+    mixed_feat = adj.squeeze()*(lam*features + (1-lam)*features[perm]) + \
+                 (1-adj.squeeze())*features
+    return mixed_img, mixed_feat, la, lb, lam, adj.squeeze()
+
+
+def cutmix_fn(images, features, labels, alpha=0.1):
+    B, _, H, W = images.shape
+    lam = float(np.random.beta(alpha, alpha))
+    lam = max(0.1, min(0.9, lam))
+    idx = torch.randperm(B, device=images.device)
+    r = math.sqrt(1-lam)
+    ch, cw = int(H*r), int(W*r)
+    cx, cy = random.randint(0,W), random.randint(0,H)
+    x1,x2 = max(0,cx-cw//2), min(W,cx+cw//2)
+    y1,y2 = max(0,cy-ch//2), min(H,cy+ch//2)
     mixed = images.clone()
-    mixed[:, :, y1:y2, x1:x2] = images[idx, :, y1:y2, x1:x2]
-    lam = 1 - (x2-x1)*(y2-y1)/(H*W)
-    return (mixed,
-            lam * features + (1-lam) * features[idx],
-            labels, labels[idx], lam)
+    mixed[:,:,y1:y2,x1:x2] = images[idx,:,y1:y2,x1:x2]
+    lam = 1-(x2-x1)*(y2-y1)/(H*W)
+    return mixed, lam*features+(1-lam)*features[idx], labels, labels[idx], lam
 
 
-def get_mixup_alpha(epoch, start=10, cutmix_start=20, max_alpha=0.3):
-    """
-    epoch < start:        no augmentation
-    start ≤ epoch < cutmix_start: MixUp only, alpha ramps 0→max_alpha
-    epoch ≥ cutmix_start: both MixUp and CutMix available
-    """
-    if epoch < start:
-        return 0.0, False
-    ramp = min(1.0, (epoch - start) / max(1, 10))
-    alpha = max_alpha * ramp
-    use_cutmix = epoch >= cutmix_start
-    return alpha, use_cutmix
+def get_aug_params(epoch):
+    """MixUp starts ep20 alpha=0.05->0.10. CutMix starts ep30."""
+    if epoch < 20:
+        return False, False, 0.
+    alpha = min(0.10, 0.05 + 0.005*(epoch-20))
+    return True, epoch >= 30, alpha
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Scheduler — clean cosine with warmup, no conflicts
+# Scheduler
 # ─────────────────────────────────────────────────────────────────────────────
-class CosineWarmupScheduler:
-    """
-    Linear warmup → cosine decay (with optional warm restarts).
-    Single source of truth for LR — no SWALR conflicts.
-    After unfreeze, call reset() to start a new cosine cycle.
-    """
-    def __init__(self, optimizer, warmup_epochs, total_epochs, min_lr_scale=0.01,
-                 n_cycles=2):
-        self.optimizer      = optimizer
-        self.warmup_epochs  = warmup_epochs
-        self.total_epochs   = total_epochs
-        self.min_lr_scale   = min_lr_scale
-        self.n_cycles       = n_cycles
-        self.epoch          = 0
-        for pg in optimizer.param_groups:
-            pg['base_lr'] = pg['lr']
+class WarmCosine:
+    def __init__(self, opt, warmup, total, min_frac=0.05):
+        self.opt=opt; self.warmup=warmup; self.total=total
+        self.min_f=min_frac; self.ep=0
+        for pg in opt.param_groups: pg['base_lr']=pg['lr']
 
     def step(self):
-        self.epoch += 1
-        e = self.epoch
-        if e <= self.warmup_epochs:
-            scale = e / max(1, self.warmup_epochs)
+        self.ep += 1
+        e = self.ep
+        if e <= self.warmup:
+            s = e/max(1,self.warmup)
         else:
-            progress  = (e - self.warmup_epochs) / max(1, self.total_epochs - self.warmup_epochs)
-            cycle_pos = (progress * self.n_cycles) % 1.0
-            scale     = self.min_lr_scale + 0.5*(1-self.min_lr_scale)*(1+math.cos(math.pi*cycle_pos))
-        for pg in self.optimizer.param_groups:
-            pg['lr'] = pg['base_lr'] * scale
+            prog = (e-self.warmup)/max(1,self.total-self.warmup)
+            s = self.min_f + 0.5*(1-self.min_f)*(1+math.cos(math.pi*prog))
+        for pg in self.opt.param_groups:
+            pg['lr'] = pg['base_lr']*s
 
-    def get_lrs(self):
-        return [pg['lr'] for pg in self.optimizer.param_groups]
-
-    def reset(self, new_lrs=None, warmup=3, total=None):
-        """Call after backbone unfreeze to start a fresh cosine cycle."""
-        self.epoch         = 0
-        self.warmup_epochs = warmup
-        self.total_epochs  = total or self.total_epochs
-        if new_lrs:
-            for pg, lr in zip(self.optimizer.param_groups, new_lrs):
-                pg['lr']      = lr
-                pg['base_lr'] = lr
+    def lrs(self): return [pg['lr'] for pg in self.opt.param_groups]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SWA BN update (dict-aware, runs only at end of training)
+# SWA BN update helpers
 # ─────────────────────────────────────────────────────────────────────────────
-@torch.no_grad()
-def update_bn_hybrid(loader, swa_model, device):
-    """One-time BN recalculation at end of training. Handles dict batches."""
+def _reset_bn(swa_model):
     for m in swa_model.modules():
         if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
             m.running_mean.zero_()
             m.running_var.fill_(1)
             m.num_batches_tracked.zero_()
+
+
+@torch.no_grad()
+def mini_bn_update(loader, swa_model, device, n=60):
+    _reset_bn(swa_model)
     swa_model.train()
-    for batch in tqdm(loader, desc="SWA BN update", leave=False):
-        images   = batch['image'].to(device)
-        features = batch['features'].to(device)
-        swa_model(images, features)
+    for i, b in enumerate(loader):
+        if i >= n: break
+        swa_model(b['image'].to(device), b['features'].to(device))
+    swa_model.eval()
+
+
+@torch.no_grad()
+def full_bn_update(loader, swa_model, device):
+    _reset_bn(swa_model)
+    swa_model.train()
+    for b in tqdm(loader, desc="SWA BN", leave=False):
+        swa_model(b['image'].to(device), b['features'].to(device))
     swa_model.eval()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Training epoch
 # ─────────────────────────────────────────────────────────────────────────────
-def train_epoch(model, loader, optimizer, criterion, device,
-                scaler, epoch, use_sam=False):
+def train_epoch(model, loader, opt, ce_fn, ord_fn, device, scaler, epoch):
     model.train()
-    total_loss = 0.0
-    correct    = 0
-    total      = 0
-    first      = True
+    tot_loss=cor=tot=0
+    first=True
+    use_mix, use_cut, alpha = get_aug_params(epoch)
 
     for batch in tqdm(loader, desc="Training", leave=False):
-        images   = batch['image'].to(device, non_blocking=True)
-        features = batch['features'].to(device, non_blocking=True)
-        labels   = batch['label'].to(device, non_blocking=True)
+        imgs  = batch['image'].to(device, non_blocking=True)
+        feats = batch['features'].to(device, non_blocking=True)
+        lbls  = batch['label'].to(device, non_blocking=True)
 
-        # Diagnostic on first batch only
         if first:
-            first = False
-            fmin, fmax = features.min().item(), features.max().item()
-            if abs(fmin) < 1e-6 and abs(fmax) < 1e-6:
-                print("  ❌  CRITICAL: features ALL ZEROS — check extractor!")
-            else:
-                print(f"  ✅  feat range [{fmin:.2f}, {fmax:.2f}]")
+            first=False
+            fmin,fmax = feats.min().item(), feats.max().item()
+            ok = "✅" if not (abs(fmin)<1e-6 and abs(fmax)<1e-6) else "❌ ALL ZERO"
+            print(f"  feat [{fmin:.2f},{fmax:.2f}] {ok}")
 
-        alpha, allow_cutmix = get_mixup_alpha(epoch)
-        lam      = 1.0
-        labels_a = labels_b = labels
+        lam=1.; la=lb=lbls; adj_mask=None
 
-        if alpha > 0.0:
-            if allow_cutmix and USE_CUTMIX and random.random() > 0.5:
-                images, features, labels_a, labels_b, lam = cutmix_batch(
-                    images, features, labels, alpha)
-            else:
-                images, features, labels_a, labels_b, lam = mixup_batch(
-                    images, features, labels, alpha)
+        if use_mix or use_cut:
+            if use_cut and USE_CUTMIX and random.random()>0.5:
+                imgs,feats,la,lb,lam = cutmix_fn(imgs,feats,lbls,alpha)
+            elif use_mix:
+                imgs,feats,la,lb,lam,adj_mask = adjacent_mixup(imgs,feats,lbls,alpha)
 
-        def forward_loss():
-            with torch.cuda.amp.autocast(enabled=(scaler is not None)):
-                logits = model(images, features)
-                if lam < 1.0:
-                    loss = lam * criterion(logits, labels_a) + \
-                           (1-lam) * criterion(logits, labels_b)
+        opt.zero_grad()
+        with torch.cuda.amp.autocast(enabled=(scaler is not None)):
+            logits, ord_logits = model(imgs, feats)
+
+            if lam < 1.:
+                if adj_mask is not None:
+                    # Per-sample: use mixed loss only where adj_mask=1
+                    ce_a = ce_fn(logits, la)
+                    ce_b = ce_fn(logits, lb)
+                    ce = (adj_mask*(lam*ce_a+(1-lam)*ce_b) +
+                          (1-adj_mask)*ce_a).mean() if ce_a.dim()==0 else \
+                         (lam*ce_a + (1-lam)*ce_b)
+                    ol = ord_fn(ord_logits, la)
                 else:
-                    loss = criterion(logits, labels)
-            return logits, loss
-
-        if use_sam:
-            logits, loss = forward_loss()
-            _backward(loss, optimizer, scaler, clip=0.5, step='first', use_sam=True)
-            logits, loss = forward_loss()
-            _backward(loss, optimizer, scaler, clip=0.5, step='second', use_sam=True)
-        else:
-            optimizer.zero_grad()
-            logits, loss = forward_loss()
-            if not torch.isfinite(loss):
-                print("  ⚠️  non-finite loss, skipping batch")
-                continue
-            _backward(loss, optimizer, scaler, clip=0.5)
-
-        total_loss += loss.item()
-        preds = logits.detach().argmax(dim=1)
-        total   += labels.size(0)
-        correct += (preds == labels).sum().item()
-
-    return total_loss / max(1, len(loader)), 100.0 * correct / max(1, total)
-
-
-def _backward(loss, optimizer, scaler, clip=0.5, step=None, use_sam=False):
-    if scaler is not None:
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(
-            [p for g in optimizer.param_groups for p in g['params']], clip
-        )
-        if use_sam:
-            if step == 'first':
-                optimizer.first_step(zero_grad=True)
+                    ce = lam*ce_fn(logits,la) + (1-lam)*ce_fn(logits,lb)
+                    ol = lam*ord_fn(ord_logits,la) + (1-lam)*ord_fn(ord_logits,lb)
             else:
-                optimizer.second_step(zero_grad=True)
-        scaler.step(optimizer)
-        scaler.update()
-    else:
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(
-            [p for g in optimizer.param_groups for p in g['params']], clip
-        )
-        if use_sam:
-            if step == 'first':
-                optimizer.first_step(zero_grad=True)
-            else:
-                optimizer.second_step(zero_grad=True)
+                ce = ce_fn(logits, lbls)
+                ol = ord_fn(ord_logits, lbls)
+
+            loss = CE_WEIGHT*ce + ORDINAL_WEIGHT*ol
+
+        if not torch.isfinite(loss):
+            print("  ⚠️  non-finite loss, skip")
+            continue
+
+        if scaler:
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+            scaler.step(opt); scaler.update()
         else:
-            optimizer.step()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+            opt.step()
+
+        tot_loss += loss.item()
+        tot      += lbls.size(0)
+        cor      += (logits.detach().argmax(1)==lbls).sum().item()
+
+    return tot_loss/max(1,len(loader)), 100.*cor/max(1,tot)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Evaluation
 # ─────────────────────────────────────────────────────────────────────────────
-def evaluate(model, loader, device, criterion, class_names,
-             use_tta=False, tta_transforms=None, verbose=False):
+def evaluate(model, loader, device, ce_fn, class_names,
+             use_tta=False, tta_t=None, verbose=False):
     model.eval()
-    all_preds  = []
-    all_labels = []
-    total_loss = 0.0
+    preds,tgts,tot_loss = [],[],0.
 
     with torch.no_grad():
-        for batch in tqdm(loader, desc="Evaluating", leave=False):
-            images   = batch['image'].to(device, non_blocking=True)
-            features = batch['features'].to(device, non_blocking=True)
-            labels   = batch['label'].to(device, non_blocking=True)
-            paths    = batch['path']
+        for batch in tqdm(loader, desc="Eval", leave=False):
+            imgs  = batch['image'].to(device, non_blocking=True)
+            feats = batch['features'].to(device, non_blocking=True)
+            lbls  = batch['label'].to(device, non_blocking=True)
 
-            if use_tta and tta_transforms:
-                logit_sum = None
-                for t in tta_transforms:
-                    imgs_aug = torch.stack([
-                        t(Image.open(p).convert('RGB')) for p in paths
-                    ]).to(device)
-                    out = model(imgs_aug, features)
-                    logit_sum = out if logit_sum is None else logit_sum + out
-                logits = logit_sum / len(tta_transforms)
+            if use_tta and tta_t:
+                ls = None
+                for t in tta_t:
+                    aug = torch.stack([t(Image.open(p).convert('RGB'))
+                                       for p in batch['path']]).to(device)
+                    out = model(aug, feats, return_ordinal=False)
+                    ls  = out if ls is None else ls+out
+                logits = ls/len(tta_t)
             else:
-                logits = model(images, features)
+                logits = model(imgs, feats, return_ordinal=False)
 
-            loss = criterion(logits, labels)
-            if torch.isfinite(loss):
-                total_loss += loss.item()
+            l = ce_fn(logits, lbls)
+            if torch.isfinite(l): tot_loss += l.item()
+            preds.extend(logits.argmax(1).cpu().numpy())
+            tgts.extend(lbls.cpu().numpy())
 
-            preds = logits.argmax(dim=1)
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
-
-    acc      = 100.0 * sum(p==l for p,l in zip(all_preds,all_labels)) / max(1, len(all_labels))
-    avg_loss = total_loss / max(1, len(loader))
-    report   = classification_report(all_labels, all_preds,
-                                     target_names=class_names,
-                                     output_dict=True, zero_division=0)
-    macro_f1 = report['macro avg']['f1-score']
+    acc  = 100.*sum(p==t for p,t in zip(preds,tgts))/max(1,len(tgts))
+    bacc = 100.*balanced_accuracy_score(tgts, preds)
+    loss = tot_loss/max(1,len(loader))
+    rep  = classification_report(tgts, preds, target_names=class_names,
+                                  output_dict=True, zero_division=0)
+    f1   = rep['macro avg']['f1-score']
 
     if verbose:
-        print("\n  Per-class accuracy:")
-        for i, name in enumerate(class_names):
-            cls_labels = [l for l in all_labels if l == i]
-            cls_preds  = [p for p,l in zip(all_preds,all_labels) if l == i]
-            cls_acc    = 100*sum(p==i for p in cls_preds)/max(1,len(cls_labels))
-            print(f"    {name:10s}: {cls_acc:5.1f}%  (n={len(cls_labels)})")
+        print("\n  Per-class results:")
+        for i,n in enumerate(class_names):
+            ct = [t for t in tgts if t==i]
+            cp = [p for p,t in zip(preds,tgts) if t==i]
+            ca = 100*sum(p==i for p in cp)/max(1,len(ct))
+            pr = rep.get(n,{})
+            print(f"    {n:8s}: acc={ca:5.1f}%  F1={pr.get('f1-score',0):.3f}"
+                  f"  P={pr.get('precision',0):.3f}  R={pr.get('recall',0):.3f} (n={len(ct)})")
+        cm = confusion_matrix(tgts, preds)
+        print("\n  Confusion matrix (rows=true, cols=pred):")
+        hdr = "          " + "".join(f"{c[:5]:>7}" for c in class_names)
+        print(hdr)
+        for i,row in enumerate(cm):
+            print(f"  {class_names[i][:7]:7s}  "+"".join(f"{v:7d}" for v in row))
 
-    return acc, avg_loss, macro_f1, all_preds, all_labels
+    return acc, bacc, loss, f1, preds, tgts
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Feature extraction
 # ─────────────────────────────────────────────────────────────────────────────
 def sanitize(arr):
-    return np.clip(np.nan_to_num(np.array(arr, dtype=np.float32),
-                                 nan=0., posinf=0., neginf=0.), -1e6, 1e6)
+    return np.clip(np.nan_to_num(np.array(arr,np.float32),
+                                 nan=0.,posinf=0.,neginf=0.), -1e6, 1e6)
 
 
-def build_feature_cache(image_paths, scaler=None, fit=False):
-    raw   = {}
-    n_bad = 0
-    for p in tqdm(image_paths, desc="Extracting features", leave=False):
+def build_cache(paths, scaler=None, fit=False):
+    raw,nbad = {},0
+    for p in tqdm(paths, desc="Features", leave=False):
         try:
-            feats = extract_medical_features(Image.open(p).convert('RGB'))
-            feats = sanitize(feats)
-            if len(feats) != NUM_TRADITIONAL_FEATURES:
-                raise ValueError(f"Expected {NUM_TRADITIONAL_FEATURES}, got {len(feats)}")
-        except Exception as e:
-            feats = np.zeros(NUM_TRADITIONAL_FEATURES, dtype=np.float32)
-            n_bad += 1
-        raw[p] = feats
+            f = extract_medical_features(Image.open(p).convert('RGB'))
+            f = sanitize(f)
+            if len(f) != NUM_FEATURES:
+                raise ValueError(f"len={len(f)}")
+        except Exception:
+            f = np.zeros(NUM_FEATURES, np.float32); nbad+=1
+        raw[p]=f
 
-    if n_bad:
-        pct = 100*n_bad/max(1,len(image_paths))
-        print(f"  ⚠️  {n_bad} ({pct:.1f}%) feature failures — zero fallback used")
-        if pct > 30:
-            print("  ❌  >30% failures — feature extractor may be broken!")
+    if nbad:
+        pct=100*nbad/max(1,len(paths))
+        print(f"  ⚠️  {nbad} ({pct:.1f}%) failures")
+        if pct>30: print("  ❌  >30% failures!")
 
     sample = np.concatenate([raw[p] for p in list(raw)[:10]])
-    if np.allclose(sample, 0.):
+    if np.allclose(sample,0.):
         print("  ❌  CRITICAL: all features zero!")
     else:
-        print(f"  ✅  Feature sanity passed — range [{sample.min():.3f}, {sample.max():.3f}]")
+        print(f"  ✅  Feature range [{sample.min():.3f},{sample.max():.3f}]")
 
     if fit:
-        all_arr = np.stack([raw[p] for p in image_paths])
-        scaler  = RobustScaler(quantile_range=(10., 90.))
-        scaler.fit(all_arr)
+        scaler = RobustScaler(quantile_range=(10.,90.))
+        scaler.fit(np.stack([raw[p] for p in paths]))
 
     cache = {}
-    for p in image_paths:
+    for p in paths:
         if scaler is not None:
-            s = np.clip(scaler.transform([raw[p]])[0], -3., 3.)
-            cache[p] = sanitize(s)
+            cache[p] = sanitize(np.clip(scaler.transform([raw[p]])[0], -3.,3.))
         else:
             cache[p] = raw[p]
-
     return cache, scaler
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────────────────────
-def train_hybrid_model(data_dir, output_dir, epochs=100, batch_size=32,
-                       lr=3e-4, early_stopping_patience=20, num_workers=4):
+def train(data_dir, output_dir, epochs=100, batch_size=32,
+          lr=2e-4, patience=20, num_workers=4):
     set_seed(42)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
+    print(f"Device: {device}")
     os.makedirs(output_dir, exist_ok=True)
-    data_path = Path(data_dir)
+    dp = Path(data_dir)
 
-    # ── Data loading ──────────────────────────────────────────────────────
-    print(f"\n📁 Scanning: {data_path}")
-    train_path = data_path / 'train'
-    val_path   = data_path / 'val'
+    # ── Load data ─────────────────────────────────────────────────────────
+    trp, vap = dp/'train', dp/'val'
 
-    def load_split(split_path, class_names):
-        paths, lbls = [], []
-        for idx, cls in enumerate(class_names):
-            d = split_path / cls
-            if not d.exists():
-                continue
-            imgs = (sorted(d.glob('*.jpg')) + sorted(d.glob('*.JPG')) +
-                    sorted(d.glob('*.png')) + sorted(d.glob('*.PNG')) +
-                    sorted(d.glob('*.jpeg')))
-            print(f"     {cls}: {len(imgs)}")
-            for ip in imgs:
-                paths.append(str(ip)); lbls.append(idx)
-        return paths, lbls
+    def load_split(sp, cls_list):
+        paths,lbls=[],[]
+        for i,c in enumerate(cls_list):
+            d=sp/c
+            if not d.exists(): continue
+            imgs=(sorted(d.glob('*.jpg'))+sorted(d.glob('*.JPG'))+
+                  sorted(d.glob('*.png'))+sorted(d.glob('*.PNG'))+
+                  sorted(d.glob('*.jpeg')))
+            print(f"     {c}: {len(imgs)}")
+            for x in imgs: paths.append(str(x)); lbls.append(i)
+        return paths,lbls
 
-    if train_path.exists() and val_path.exists():
-        class_names = sorted([p.name for p in train_path.iterdir() if p.is_dir()])
-        print(f"✅ Pre-split found. Classes: {class_names}")
-        print("\n📂 train/")
-        tr_paths, tr_labels = load_split(train_path, class_names)
-        print("📂 val/")
-        va_paths, va_labels = load_split(val_path, class_names)
-
-        # Re-split if val is severely imbalanced
-        val_counts = Counter(va_labels)
-        ratio = max(val_counts.values()) / max(min(val_counts.values()), 1)
-        if ratio > 3.0:
-            print(f"\n⚠️  Val imbalanced ({ratio:.1f}×) — re-splitting 80/20 stratified")
-            all_paths  = tr_paths + va_paths
-            all_labels = tr_labels + va_labels
-            tr_paths, va_paths, tr_labels, va_labels = train_test_split(
-                all_paths, all_labels, test_size=0.2, random_state=42,
-                stratify=all_labels)
-            print("📊 Re-split:")
-            tc, vc = Counter(tr_labels), Counter(va_labels)
-            for i, n in enumerate(class_names):
-                print(f"   {n}: train={tc[i]}  val={vc[i]}")
+    if trp.exists() and vap.exists():
+        cls = sorted([p.name for p in trp.iterdir() if p.is_dir()])
+        print(f"✅ Classes (alphabetical): {cls}")
+        print("📂 train/"); tr_p,tr_l = load_split(trp,cls)
+        print("📂 val/");   va_p,va_l = load_split(vap,cls)
+        vc = Counter(va_l)
+        if max(vc.values())/max(min(vc.values()),1) > 3:
+            print(f"⚠️  Val imbalanced — re-splitting 80/20")
+            ap,al = tr_p+va_p, tr_l+va_l
+            tr_p,va_p,tr_l,va_l = train_test_split(
+                ap,al,test_size=0.2,random_state=42,stratify=al)
+            tc,vc2 = Counter(tr_l),Counter(va_l)
+            for i,n in enumerate(cls):
+                print(f"   {n}: train={tc[i]}  val={vc2[i]}")
     else:
-        class_names = sorted([p.name for p in data_path.iterdir()
-                               if p.is_dir() and p.name not in
-                               ('test','synthetic','sipakmed_raw')])
-        all_paths, all_labels = load_split(data_path, class_names)
-        tr_paths, va_paths, tr_labels, va_labels = train_test_split(
-            all_paths, all_labels, test_size=0.2, random_state=42,
-            stratify=all_labels)
+        cls = sorted([p.name for p in dp.iterdir()
+                      if p.is_dir() and p.name not in ('test','synthetic','sipakmed_raw')])
+        ap,al = load_split(dp,cls)
+        tr_p,va_p,tr_l,va_l = train_test_split(ap,al,test_size=0.2,
+                                                 random_state=42,stratify=al)
 
-    print(f"\n✅ Train: {len(tr_paths)}  Val: {len(va_paths)}")
-    if not tr_paths:
-        raise ValueError("No training images found.")
+    print(f"\n✅ Train: {len(tr_p)}  Val: {len(va_p)}")
+    if not tr_p: raise ValueError("No training images found.")
 
-    # ── Feature extraction ────────────────────────────────────────────────
-    print("\n🔍 Extracting train features...")
-    tr_cache, scaler = build_feature_cache(tr_paths, fit=True)
-    print("🔍 Extracting val features...")
-    va_cache, _      = build_feature_cache(va_paths, scaler=scaler)
+    # Remap labels to severity order for ordinal loss to work correctly
+    sev_present = [c for c in SEVERITY_ORDER if c in cls]
+    if set(sev_present) == set(cls):
+        old2new = {cls.index(c): sev_present.index(c) for c in cls}
+        tr_l = [old2new[l] for l in tr_l]
+        va_l = [old2new[l] for l in va_l]
+        cls  = sev_present
+        print(f"✅ Labels remapped to severity order: {cls}")
+    else:
+        print(f"⚠️  Cannot remap to severity order. Ordinal loss may be less effective.")
 
-    # ── Datasets ──────────────────────────────────────────────────────────
-    train_ds = HybridDataset(tr_paths, tr_labels, get_train_transform(CNN_INPUT_SIZE), tr_cache)
-    val_ds   = HybridDataset(va_paths, va_labels, get_val_transform(CNN_INPUT_SIZE),   va_cache)
-    tta_tfms = build_tta_transforms(CNN_INPUT_SIZE) if USE_TTA else None
+    # ── Features ──────────────────────────────────────────────────────────
+    print("\n🔍 Train features...")
+    tr_cache, scaler = build_cache(tr_p, fit=True)
+    print("🔍 Val features...")
+    va_cache, _      = build_cache(va_p, scaler=scaler)
 
-    # WeightedRandomSampler — 2× weight for minority class (Normal)
-    class_counts = Counter(tr_labels)
-    normal_idx   = class_names.index('Normal') if 'Normal' in class_names else -1
-    sw = [(1./class_counts[l]) * (2. if l==normal_idx else 1.) for l in tr_labels]
-    sampler = WeightedRandomSampler(sw, len(tr_labels), replacement=True)
+    # ── Datasets & loaders ────────────────────────────────────────────────
+    tr_ds = HybridDataset(tr_p, tr_l, train_transform(INPUT_SIZE), tr_cache)
+    va_ds = HybridDataset(va_p, va_l, val_transform(INPUT_SIZE),   va_cache)
+    tta_t = tta_transforms(INPUT_SIZE) if USE_TTA else None
+
+    # 3x weight for hard classes: CIN2, CIN3, Cancer
+    tc       = Counter(tr_l)
+    hard_idx = {cls.index(c) for c in ['CIN2','CIN3','Cancer'] if c in cls}
+    sw       = [(1./tc[l])*(3. if l in hard_idx else 1.) for l in tr_l]
+    sampler  = WeightedRandomSampler(sw, len(tr_l), replacement=True)
 
     nw = min(num_workers, os.cpu_count() or 0)
-    train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=sampler,
-                              num_workers=nw, pin_memory=True, drop_last=True,
-                              persistent_workers=(nw > 0))
-    val_loader   = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
-                              num_workers=nw, pin_memory=True,
-                              persistent_workers=(nw > 0))
+    tr_loader = DataLoader(tr_ds, batch_size, sampler=sampler, num_workers=nw,
+                           pin_memory=True, drop_last=True, persistent_workers=(nw>0))
+    va_loader = DataLoader(va_ds, batch_size, shuffle=False, num_workers=nw,
+                           pin_memory=True, persistent_workers=(nw>0))
 
     # ── Model ─────────────────────────────────────────────────────────────
-    model = build_model(len(class_names), NUM_TRADITIONAL_FEATURES, device,
-                        dropout=0.4, drop_path_rate=0.2)
+    model = build_model(len(cls), NUM_FEATURES, device, dropout=0.3, dpr=0.2)
     freeze_backbone(model)
 
-    # ── Optimizer ─────────────────────────────────────────────────────────
-    backbone_ids  = {id(p) for p in model.backbone.parameters()}
-    head_params   = [p for p in model.parameters() if id(p) not in backbone_ids]
-    back_params   = list(model.backbone.parameters())
+    # ── Optimizer helpers ─────────────────────────────────────────────────
+    bb_ids = {id(p) for p in model.backbone.parameters()}
+    head_p = [p for p in model.parameters() if id(p) not in bb_ids]
+    back_p = list(model.backbone.parameters())
 
-    def make_optimizer(backbone_lr, head_lr):
-        groups = [
-            {'params': back_params, 'lr': backbone_lr, 'weight_decay': 1e-4},
-            {'params': head_params, 'lr': head_lr,     'weight_decay': 1e-4},
-        ]
-        if USE_SAM:
-            return SAM(groups, torch.optim.AdamW, rho=0.05,
-                       lr=head_lr, weight_decay=1e-4)
-        return torch.optim.AdamW(groups)
+    def make_opt(bb_lr, hd_lr):
+        return torch.optim.AdamW([
+            {'params': back_p, 'lr': bb_lr, 'weight_decay': 1e-4},
+            {'params': head_p, 'lr': hd_lr, 'weight_decay': 1e-4},
+        ])
 
-    # Phase 1: head-only — backbone lr irrelevant (frozen), head lr=lr
-    optimizer = make_optimizer(backbone_lr=lr*0.1, head_lr=lr)
-    scheduler = CosineWarmupScheduler(optimizer,
-                                      warmup_epochs=3,
-                                      total_epochs=BACKBONE_FREEZE_EPOCHS,
-                                      min_lr_scale=0.05, n_cycles=1)
+    opt = make_opt(lr*0.1, lr)
+    sch = WarmCosine(opt, warmup=3, total=FREEZE_EPOCHS, min_frac=0.05)
 
-    # ── Loss — no class weights (sampler handles balance) ─────────────────
-    criterion = FocalLoss(gamma=1.5, smoothing=0.1, num_classes=len(class_names))
+    # ── Loss ──────────────────────────────────────────────────────────────
+    ce_fn  = FocalLoss(gamma=1.0, smoothing=0.08, num_classes=len(cls))
+    ord_fn = OrdinalLoss(num_classes=len(cls), smoothing=0.05)
 
-    # ── AMP ───────────────────────────────────────────────────────────────
-    scaler = torch.cuda.amp.GradScaler() if torch.cuda.is_available() else None
-
-    # ── SWA ───────────────────────────────────────────────────────────────
-    swa_model = AveragedModel(model) if USE_SWA else None
+    # ── AMP / SWA ─────────────────────────────────────────────────────────
+    amp_scaler = torch.cuda.amp.GradScaler() if torch.cuda.is_available() else None
+    swa_model  = AveragedModel(model) if USE_SWA else None
 
     print(f"\n{'='*70}")
-    print(f"  AMP    : {'✅' if scaler else '❌'}")
-    print(f"  TTA    : {'✅ (every '+str(TTA_EVERY_N)+' val epochs)' if USE_TTA else '❌'}")
-    print(f"  SWA    : {'✅ (start ep '+str(SWA_START)+')' if USE_SWA else '❌'}")
-    print(f"  SAM    : {'✅' if USE_SAM else '❌'}")
-    print(f"  CutMix : {'✅' if USE_CUTMIX else '❌'}")
-    print(f"  MixUp  : ✅ (starts ep 10, ramps to alpha=0.3)")
-    print(f"  LR     : head={lr:.1e}  backbone={lr*0.1:.1e} (after unfreeze: {lr*0.5:.1e}/{lr*0.05:.1e})")
+    print(f"  v10 key changes:")
+    print(f"  - Loss: {CE_WEIGHT}xFocalLoss + {ORDINAL_WEIGHT}xOrdinalLoss")
+    print(f"  - Adjacent-grade MixUp only (alpha<=0.10, starts ep20)")
+    print(f"  - CIN2/CIN3/Cancer get 3x sampler weight")
+    print(f"  - Backbone unfreeze: 1 stage per {UNFREEZE_STEP} epochs (slower)")
+    print(f"  - SWA: mini BN update before every eval (real scores)")
+    print(f"  - Checkpoint on F1 + balanced accuracy")
     print(f"{'='*70}\n")
 
-    best_f1          = 0.
-    best_val_acc     = 0.
-    best_val_loss    = float('inf')
-    patience_counter = 0
-    backbone_unfrozen = False
-    checkpoint_path  = os.path.join(output_dir, 'best_model.pt')
-    history = {k: [] for k in ['train_loss','train_acc','val_loss','val_acc','val_f1']}
+    best_f1=best_bacc=best_acc=0.
+    pat=0; unfrz=False
+    ckpt = os.path.join(output_dir, 'best_model.pt')
+    hist = {k:[] for k in ['tr_loss','tr_acc','va_loss','va_acc','va_f1','va_bacc']}
 
-    for epoch in range(epochs):
+    for ep in range(epochs):
         print(f"\n{'='*70}")
-        print(f"Epoch {epoch+1}/{epochs}")
+        print(f"Epoch {ep+1}/{epochs}")
         print(f"{'='*70}")
 
-        # ── Progressive unfreeze ──────────────────────────────────────────
-        if not backbone_unfrozen and epoch >= BACKBONE_FREEZE_EPOCHS:
-            backbone_unfrozen = True
-            unfreeze_progressive(model, epoch, BACKBONE_FREEZE_EPOCHS, epochs)
+        # Unfreeze
+        if not unfrz and ep >= FREEZE_EPOCHS:
+            unfrz = True
+            unfreeze_progressive(model, ep, FREEZE_EPOCHS)
+            opt = make_opt(lr*0.05, lr)
+            sch = WarmCosine(opt, warmup=4, total=epochs-ep, min_frac=0.03)
+            if USE_SWA: swa_model = AveragedModel(model)
+            print(f"  Optimizer reset: head_lr={lr:.1e} bb_lr={lr*0.05:.1e}")
+        elif unfrz and ep > FREEZE_EPOCHS:
+            unfreeze_progressive(model, ep, FREEZE_EPOCHS)
 
-            # After unfreeze: higher head LR (head is now well-trained),
-            # very small backbone LR (don't destroy ImageNet features)
-            optimizer = make_optimizer(backbone_lr=lr*0.05, head_lr=lr*0.5)
-            remaining = epochs - epoch
-            scheduler = CosineWarmupScheduler(optimizer,
-                                              warmup_epochs=UNFREEZE_WARMUP_EPOCHS,
-                                              total_epochs=remaining,
-                                              min_lr_scale=0.01, n_cycles=2)
-            if USE_SWA:
-                swa_model = AveragedModel(model)  # reset SWA after unfreeze
-            print(f"  Optimizer reset — head_lr={lr*0.5:.1e} backbone_lr={lr*0.05:.1e}")
-
-        elif backbone_unfrozen and epoch > BACKBONE_FREEZE_EPOCHS:
-            unfreeze_progressive(model, epoch, BACKBONE_FREEZE_EPOCHS, epochs)
-
-        # ── Train ─────────────────────────────────────────────────────────
+        # Train
         tr_loss, tr_acc = train_epoch(
-            model, train_loader, optimizer, criterion, device,
-            scaler=scaler, epoch=epoch, use_sam=USE_SAM,
-        )
+            model, tr_loader, opt, ce_fn, ord_fn, device, amp_scaler, ep)
 
-        # ── SWA update (no BN update every epoch — saves time) ───────────
-        use_swa = USE_SWA and (epoch >= SWA_START)
+        # SWA
+        use_swa = USE_SWA and ep >= SWA_START
         if use_swa:
             swa_model.update_parameters(model)
+            mini_bn_update(tr_loader, swa_model, device, n=60)
 
-        # ── Scheduler step ────────────────────────────────────────────────
-        scheduler.step()
+        sch.step()
 
-        # ── Evaluate ──────────────────────────────────────────────────────
-        eval_model = swa_model if use_swa else model
-        do_tta     = USE_TTA and ((epoch+1) % TTA_EVERY_N == 0)
-        verbose    = (epoch+1) % 10 == 0
+        # Eval
+        do_tta  = USE_TTA and (ep+1)%TTA_EVERY==0
+        verbose = (ep+1)%10==0
+        eval_m  = swa_model if use_swa else model
 
-        val_acc, val_loss, macro_f1, _, _ = evaluate(
-            eval_model, val_loader, device, criterion, class_names,
-            use_tta=do_tta, tta_transforms=tta_tfms, verbose=verbose,
-        )
+        va_acc,va_bacc,va_loss,f1,_,_ = evaluate(
+            eval_m, va_loader, device, ce_fn, cls,
+            use_tta=do_tta, tta_t=tta_t, verbose=verbose)
 
-        lrs = scheduler.get_lrs()
-        alpha, _ = get_mixup_alpha(epoch)
-        tta_tag = " [TTA]" if do_tta else ""
-        swa_tag = " [SWA]" if use_swa else ""
-        print(f"Train  — loss: {tr_loss:.4f} | acc: {tr_acc:.2f}%")
-        print(f"Val    — loss: {val_loss:.4f} | acc: {val_acc:.2f}% | "
-              f"F1: {macro_f1:.4f}{tta_tag}{swa_tag}")
-        print(f"LR     — head={lrs[1]:.2e} backbone={lrs[0]:.2e} | "
-              f"mixup_alpha={alpha:.3f}")
+        lrs = sch.lrs()
+        _,_,alpha = get_aug_params(ep)
+        tags = ("" + (" [TTA]" if do_tta else "") + (" [SWA]" if use_swa else ""))
+        print(f"Train  — loss:{tr_loss:.4f} | acc:{tr_acc:.2f}%")
+        print(f"Val    — loss:{va_loss:.4f} | acc:{va_acc:.2f}%"
+              f" | bal:{va_bacc:.2f}% | F1:{f1:.4f}{tags}")
+        print(f"LR     — head={lrs[1]:.2e} bb={lrs[0]:.2e} | alpha={alpha:.3f}")
 
-        for k, v in zip(['train_loss','train_acc','val_loss','val_acc','val_f1'],
-                        [tr_loss, tr_acc, val_loss, val_acc, macro_f1]):
-            history[k].append(v)
+        for k,v in zip(['tr_loss','tr_acc','va_loss','va_acc','va_f1','va_bacc'],
+                       [tr_loss,tr_acc,va_loss,va_acc,f1,va_bacc]):
+            hist[k].append(v)
 
-        # ── Checkpoint ────────────────────────────────────────────────────
-        improved = (macro_f1 > best_f1 + 1e-4) or \
-                   (val_acc > best_val_acc + 0.5 and macro_f1 > best_f1 - 0.01)
+        # Checkpoint — improved on F1 or balanced accuracy
+        improved = (f1 > best_f1+5e-4) or \
+                   (va_bacc > best_bacc+0.3 and f1 > best_f1-0.01) or \
+                   (va_acc  > best_acc +0.5 and f1 > best_f1-0.005)
         if improved:
-            best_f1       = macro_f1
-            best_val_acc  = val_acc
-            best_val_loss = val_loss
-            patience_counter = 0
-            save_m = swa_model if use_swa else model
+            best_f1=f1; best_bacc=va_bacc; best_acc=va_acc; pat=0
+            sm = swa_model if use_swa else model
             torch.save({
-                'epoch':            epoch+1,
-                'model_state_dict': save_m.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_acc':          val_acc,
-                'macro_f1':         macro_f1,
-                'class_names':      class_names,
-                'num_features':     NUM_TRADITIONAL_FEATURES,
-                'feat_out_dim':     FEAT_OUT_DIM,
-                'input_size':       CNN_INPUT_SIZE,
-                'script_version':   _SCRIPT_VERSION,
-                'use_swa':          use_swa,
-            }, checkpoint_path)
-            print(f"✅ Checkpoint saved (F1={macro_f1:.4f}, acc={val_acc:.2f}%)")
+                'epoch':ep+1, 'model_state_dict':sm.state_dict(),
+                'val_acc':va_acc,'val_bacc':va_bacc,'macro_f1':f1,
+                'class_names':cls,'num_features':NUM_FEATURES,
+                'feat_dim':FEAT_DIM,'input_size':INPUT_SIZE,
+                'version':_VERSION,'use_swa':use_swa,
+            }, ckpt)
+            print(f"✅ Saved (F1={f1:.4f}, acc={va_acc:.2f}%, bal={va_bacc:.2f}%)")
         else:
-            patience_counter += 1
-            print(f"   No improvement ({patience_counter}/{early_stopping_patience})")
-            if patience_counter >= early_stopping_patience:
-                print(f"\n⏹️  Early stopping at epoch {epoch+1}")
+            pat+=1
+            print(f"   No improvement ({pat}/{patience})")
+            if pat>=patience:
+                print(f"\n⏹️  Early stopping at ep{ep+1}")
                 break
 
-    # ── Final SWA BN update ────────────────────────────────────────────────
-    if USE_SWA and swa_model is not None and epoch >= SWA_START:
-        print("\n🔄 Running final SWA BN update...")
-        update_bn_hybrid(train_loader, swa_model, device)
-        swa_acc, swa_loss, swa_f1, _, _ = evaluate(
-            swa_model, val_loader, device, criterion, class_names,
-            use_tta=USE_TTA, tta_transforms=tta_tfms, verbose=True,
-        )
-        print(f"  SWA final — acc={swa_acc:.2f}%  F1={swa_f1:.4f}")
-        swa_path = os.path.join(output_dir, 'swa_model.pt')
-        torch.save({'model_state_dict': swa_model.state_dict(),
-                    'class_names': class_names,
-                    'num_features': NUM_TRADITIONAL_FEATURES,
-                    'feat_out_dim': FEAT_OUT_DIM,
-                    'input_size': CNN_INPUT_SIZE,
-                    'script_version': _SCRIPT_VERSION}, swa_path)
-        print(f"  SWA model saved: {swa_path}")
+    # Final SWA BN
+    if USE_SWA and swa_model is not None and ep>=SWA_START:
+        print("\n🔄 Final SWA BN update...")
+        full_bn_update(tr_loader, swa_model, device)
+        sa,sb,sl,sf,_,_ = evaluate(swa_model,va_loader,device,ce_fn,cls,
+                                    use_tta=USE_TTA,tta_t=tta_t,verbose=True)
+        print(f"  SWA final — acc={sa:.2f}% bal={sb:.2f}% F1={sf:.4f}")
+        sp=os.path.join(output_dir,'swa_model.pt')
+        torch.save({'model_state_dict':swa_model.state_dict(),'class_names':cls,
+                    'num_features':NUM_FEATURES,'feat_dim':FEAT_DIM,
+                    'input_size':INPUT_SIZE,'version':_VERSION},sp)
+        print(f"  SWA saved: {sp}")
+        if sf>best_f1 or sb>best_bacc:
+            import shutil; shutil.copy(sp,ckpt)
+            print(f"  ✅ SWA is best — copied to {ckpt}")
 
-    with open(os.path.join(output_dir, 'history.json'), 'w') as f:
-        json.dump(history, f, indent=2)
+    with open(os.path.join(output_dir,'history.json'),'w') as f:
+        json.dump(hist,f,indent=2)
 
     print(f"\n{'='*70}")
-    print(f"✅ Training complete!")
-    print(f"   Best val acc : {best_val_acc:.2f}%")
-    print(f"   Best macro-F1: {best_f1:.4f}")
-    print(f"   Checkpoint   : {checkpoint_path}")
+    print(f"✅ Done! best_acc={best_acc:.2f}% balanced={best_bacc:.2f}% F1={best_f1:.4f}")
     print(f"{'='*70}")
-    return checkpoint_path
+    return ckpt
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Train hybrid cervical cancer classifier v9')
+    parser = argparse.ArgumentParser()
     parser.add_argument('--data-dir',                type=str,   default='/kaggle/working/data')
     parser.add_argument('--checkpoint-dir',          type=str,   default='./checkpoints')
     parser.add_argument('--epochs',                  type=int,   default=100)
     parser.add_argument('--batch-size',              type=int,   default=32)
-    parser.add_argument('--learning-rate',           type=float, default=3e-4)
+    parser.add_argument('--learning-rate',           type=float, default=2e-4)
     parser.add_argument('--early-stopping-patience', type=int,   default=20)
     parser.add_argument('--num-workers',             type=int,   default=4)
     parser.add_argument('--seed',                    type=int,   default=42)
@@ -1148,18 +927,18 @@ if __name__ == '__main__':
     set_seed(args.seed)
 
     print(f"\n{'='*70}")
-    print(f"🚀 TRAINING CONFIGURATION — v9 (accuracy push)")
+    print(f"v10 — CIN-confusion fix + ordinal loss")
     print(f"{'='*70}")
-    for k, v in vars(args).items():
+    for k,v in vars(args).items():
         print(f"  {k:<30}: {v}")
     print(f"{'='*70}\n")
 
-    train_hybrid_model(
-        data_dir   = args.data_dir,
-        output_dir = args.checkpoint_dir,
-        epochs     = args.epochs,
-        batch_size = args.batch_size,
-        lr         = args.learning_rate,
-        early_stopping_patience = args.early_stopping_patience,
+    train(
+        data_dir    = args.data_dir,
+        output_dir  = args.checkpoint_dir,
+        epochs      = args.epochs,
+        batch_size  = args.batch_size,
+        lr          = args.learning_rate,
+        patience    = args.early_stopping_patience,
         num_workers = args.num_workers,
     )
