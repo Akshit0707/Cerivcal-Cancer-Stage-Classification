@@ -71,7 +71,7 @@ CNN_DIM         = 1536
 FUSION_DIM      = CNN_DIM + FEAT_DIM   # 1664
 
 FREEZE_EPOCHS   = 10
-UNFREEZE_STEP   = 10
+UNFREEZE_STEP   = 20
 ORDINAL_WEIGHT  = 0.3
 CE_WEIGHT       = 0.7
 
@@ -405,10 +405,10 @@ def cutmix_fn(images, features, labels, alpha=0.1):
 
 
 def get_aug_params(epoch):
-    if epoch < 30:
+    if epoch < 40:
         return False, False, 0.
-    alpha = min(0.10, 0.05 + 0.005*(epoch-30))
-    return True, epoch >= 40, alpha
+    alpha = min(0.05, 0.02 + 0.002*(epoch-40))
+    return True, epoch >= 50, alpha
 
 
 # ─────────────────────────────────────────────────────────────────────────────
