@@ -803,10 +803,14 @@ def train(data_dir, output_dir, epochs=100, batch_size=32,
                     'lr': lr * 0.005,
                     'weight_decay': 1e-4,
                 })
-                opt.param_groups[-1]['base_lr'] = lr * 0.005
-            for pg in opt.param_groups[:-1]:
-                pg['lr'] = lr * 0.5
-                pg['base_lr'] = lr * 0.5
+            # Set base_lr on ALL groups before creating scheduler
+            for i, pg in enumerate(opt.param_groups):
+                if i == len(opt.param_groups) - 1:
+                    pg['lr']      = lr * 0.005
+                    pg['base_lr'] = lr * 0.005
+                else:
+                    pg['lr']      = lr * 0.5
+                    pg['base_lr'] = lr * 0.5
             sch = WarmCosine(opt, warmup=2, total=epochs-ep, min_frac=0.03)
             if USE_SWA:
                 swa_model = AveragedModel(model)
