@@ -647,7 +647,7 @@ def build_cache(paths, scaler=None, fit=False):
 # MAIN
 # ─────────────────────────────────────────────────────────────────────────────
 def train(data_dir, output_dir, epochs=100, batch_size=32,
-          lr=2e-4, patience=20, num_workers=4):
+          lr=2e-4, patience=20, num_workers=4, resume=False):
     set_seed(42)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
@@ -742,6 +742,19 @@ def train(data_dir, output_dir, epochs=100, batch_size=32,
     # ── Model ─────────────────────────────────────────────────────────────
     model = build_model(len(cls), NUM_FEATURES, device, dropout=0.3, dpr=0.2)
     freeze_backbone(model)
+    start_epoch = 0
+if resume:
+    ckpt_path = os.path.join(output_dir, 'best_model.pt')
+    if os.path.exists(ckpt_path):
+        ck = torch.load(ckpt_path, map_location=device)
+        model.load_state_dict(ck['model_state_dict'])
+        start_epoch = ck.get('epoch', 0)
+        best_f1     = ck.get('macro_f1', 0.)
+        best_bacc   = ck.get('val_bacc', 0.)
+        best_acc    = ck.get('val_acc',  0.)
+        print(f"▶️  Resumed from epoch {start_epoch}  F1={best_f1:.4f}  bal={best_bacc:.2f}%")
+    else:
+        print("⚠️  No checkpoint found — starting from scratch")
 
     # ── Optimizer helpers ─────────────────────────────────────────────────
     bb_ids = {id(p) for p in model.backbone.parameters()}
@@ -781,7 +794,7 @@ def train(data_dir, output_dir, epochs=100, batch_size=32,
     ckpt = os.path.join(output_dir, 'best_model.pt')
     hist = {k:[] for k in ['tr_loss','tr_acc','va_loss','va_acc','va_f1','va_bacc']}
 
-    for ep in range(epochs):
+    for ep in range(start_epoch, epochs):
         print(f"\n{'='*70}")
         print(f"Epoch {ep+1}/{epochs}")
         print(f"{'='*70}")
@@ -909,6 +922,8 @@ if __name__ == '__main__':
     parser.add_argument('--no-swa',    action='store_true')
     parser.add_argument('--use-sam',   action='store_true')
     parser.add_argument('--no-cutmix', action='store_true')
+    parser.add_argument('--resume', action='store_true',
+                    help='Resume from best_model.pt in checkpoint-dir')
     args = parser.parse_args()
 
     if args.no_tta:    USE_TTA    = False
@@ -933,4 +948,5 @@ if __name__ == '__main__':
         lr          = args.learning_rate,
         patience    = args.early_stopping_patience,
         num_workers = args.num_workers,
+         resume = args.resume,
     )
