@@ -237,7 +237,7 @@ def load_model(
 
 
 def get_class_names():
-    return ['CIN1', 'CIN2', 'CIN3', 'Normal', 'Cancer']
+    return ['Dysplasia', 'Koilocytosis', 'Metaplasia', 'Parabasal', 'Superficial']
 
 
 # ---------------------------------------------------------------------------

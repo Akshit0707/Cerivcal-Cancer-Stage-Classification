@@ -1201,7 +1201,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Train hybrid cervical cancer classifier')
     parser.add_argument('--data-dir',                type=str,   default='/kaggle/working/data')
     parser.add_argument('--checkpoint-dir',          type=str,   default='./checkpoints')
-    parser.add_argument('--epochs',                  type=int,   default=100)
+    parser.add_argument('--epochs',                  type=int,   default=50)
     parser.add_argument('--batch-size',              type=int,   default=32)
     parser.add_argument('--learning-rate',           type=float, default=5e-4)
     parser.add_argument('--early-stopping-patience', type=int,   default=20)
