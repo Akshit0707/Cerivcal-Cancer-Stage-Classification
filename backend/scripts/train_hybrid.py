@@ -80,7 +80,7 @@ CE_WEIGHT       = 0.7
 SEVERITY_ORDER = ['Normal', 'CIN1', 'HighGrade', 'Cancer']
 
 # Classes that get 3x sampler weight (harder / less represented)
-HARD_CLASSES   = {'HighGrade', 'Cancer'}
+HARD_CLASSES   = {'HighGrade', 'Cancer','Normal'}  # Normal is now abundant, so give it more weight to balance
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Path setup
