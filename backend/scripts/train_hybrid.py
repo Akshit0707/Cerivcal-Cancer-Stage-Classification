@@ -828,6 +828,7 @@ def train(data_dir, output_dir, epochs=100, batch_size=32,
                 pg['lr']      = lr * 0.5
                 pg['base_lr'] = lr * 0.5
             sch.ep = ep  # reset scheduler position to current epoch
+            sch.total = max(60, epochs - ep)
         elif unfrz and ep > FREEZE_EPOCHS:
             unfreeze_progressive(model, ep, FREEZE_EPOCHS)
 
