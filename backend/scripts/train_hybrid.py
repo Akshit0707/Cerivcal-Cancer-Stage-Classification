@@ -287,7 +287,7 @@ def unfreeze_progressive(model, epoch, freeze_start):
         for p in model.backbone.parameters(): p.requires_grad = True
         print("  Backbone fully unfrozen")
         return
-    n = min(len(stages), 1 + (epoch-freeze_start)//UNFREEZE_STEP)
+    n = min(len(stages), 1 + max(0, (epoch-freeze_start-1)//UNFREEZE_STEP))
     for i, s in enumerate(reversed(stages)):
         for p in s.parameters():
             p.requires_grad = (i < n)
@@ -405,10 +405,10 @@ def cutmix_fn(images, features, labels, alpha=0.1):
 
 
 def get_aug_params(epoch):
-    if epoch < 20:
+    if epoch < 30:
         return False, False, 0.
-    alpha = min(0.10, 0.05 + 0.005*(epoch-20))
-    return True, epoch >= 30, alpha
+    alpha = min(0.10, 0.05 + 0.005*(epoch-30))
+    return True, epoch >= 40, alpha
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -800,6 +800,10 @@ def train(data_dir, output_dir, epochs=100, batch_size=32,
             back_p = list(model.backbone.parameters())
             
             opt = make_opt(lr * 0.01, lr)  # Recreate with unfrozen backbone
+            # Cap head LR at half original after unfreeze
+            for pg in opt.param_groups[:-1]:
+                pg['lr'] = lr * 0.5
+                pg['base_lr'] = lr * 0.5
             sch = WarmCosine(opt, warmup=2, total=epochs-ep, min_frac=0.03)
             
             if USE_SWA:
@@ -822,7 +826,7 @@ def train(data_dir, output_dir, epochs=100, batch_size=32,
 
         # Eval
         do_tta  = USE_TTA and (ep+1)%TTA_EVERY==0
-        verbose = (ep+1)%10==0
+        verbose = True
         eval_m  = swa_model if use_swa else model
 
         va_acc,va_bacc,va_loss,f1,_,_ = evaluate(
@@ -912,7 +916,7 @@ if __name__ == '__main__':
     parser.add_argument('--checkpoint-dir',          type=str,   default='./checkpoints')
     parser.add_argument('--epochs',                  type=int,   default=100)
     parser.add_argument('--batch-size',              type=int,   default=32)
-    parser.add_argument('--learning-rate',           type=float, default=2e-4)
+    parser.add_argument('--learning-rate',           type=float, default=1e-4)
     parser.add_argument('--early-stopping-patience', type=int,   default=20)
     parser.add_argument('--num-workers',             type=int,   default=4)
     parser.add_argument('--seed',                    type=int,   default=42)
