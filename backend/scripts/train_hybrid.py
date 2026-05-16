@@ -733,44 +733,14 @@ def train(data_dir, output_dir, epochs=100, batch_size=32,
     model = build_model(len(cls), NUM_FEATURES, device, dropout=0.5, dpr=0.4)
     freeze_backbone(model)
 
-    # ── Resume from checkpoint ────────────────────────────────────────────
-    start_epoch = 0
-    best_f1 = best_bacc = best_acc = 0.
-    if resume:
-        ckpt_path = os.path.join(output_dir, 'best_model.pt')
-        if os.path.exists(ckpt_path):
-            ck = torch.load(ckpt_path, map_location=device, weights_only=False)
-            model.load_state_dict(ck['model_state_dict'])
-            if 'opt_state' in ck:
-                try:
-                    opt.load_state_dict(ck['opt_state'])
-                    print(f"  ✅ Optimizer state restored")
-                except Exception as e:
-                    print(f"  ⚠️  Could not restore optimizer state: {e}")
-            if 'sch_ep' in ck:
-                sch.ep = ck['sch_ep']
-                print(f"  ✅ Scheduler restored at ep={sch.ep}")
-            start_epoch = ck.get('epoch', 0)
-            best_f1     = ck.get('macro_f1', 0.)
-            best_bacc   = ck.get('val_bacc', 0.)
-            best_acc    = ck.get('val_acc',  0.)
-            print(f"▶️  Resumed from epoch {start_epoch}  F1={best_f1:.4f}  bal={best_bacc:.2f}%")
-        else:
-            print("⚠️  No checkpoint found — starting from scratch")
-
-    # ── Optimizer helpers ─────────────────────────────────────────────────
+    # ── Optimizer ─────────────────────────────────────────────────────────
     bb_ids = {id(p) for p in model.backbone.parameters()}
     head_p = [p for p in model.parameters() if id(p) not in bb_ids]
     back_p = list(model.backbone.parameters())
 
-    def make_opt(bb_lr, hd_lr):
-        return torch.optim.AdamW([
-            {'params': back_p, 'lr': bb_lr, 'weight_decay': 1e-4},
-            {'params': head_p, 'lr': hd_lr, 'weight_decay': 1e-4},
-        ])
-
-    # Create optimizer BEFORE the resume block
-    opt = make_opt(lr * 0.01, lr)
+    opt = torch.optim.AdamW([
+        {'params': head_p, 'lr': lr, 'weight_decay': 1e-4},
+    ])
     sch = WarmCosine(opt, warmup=3, total=epochs, min_frac=0.05)
 
     # ── Resume from checkpoint ────────────────────────────────────────────
@@ -781,15 +751,6 @@ def train(data_dir, output_dir, epochs=100, batch_size=32,
         if os.path.exists(ckpt_path):
             ck = torch.load(ckpt_path, map_location=device, weights_only=False)
             model.load_state_dict(ck['model_state_dict'])
-            if 'opt_state' in ck:
-                try:
-                    opt.load_state_dict(ck['opt_state'])
-                    print(f"  ✅ Optimizer state restored")
-                except Exception as e:
-                    print(f"  ⚠️  Could not restore optimizer state: {e}")
-            if 'sch_ep' in ck:
-                sch.ep = ck['sch_ep']
-                print(f"  ✅ Scheduler restored at ep={sch.ep}")
             start_epoch = ck.get('epoch', 0)
             best_f1     = ck.get('macro_f1', 0.)
             best_bacc   = ck.get('val_bacc', 0.)
@@ -812,18 +773,18 @@ def train(data_dir, output_dir, epochs=100, batch_size=32,
     print(f"  Loss          : {CE_WEIGHT}xFocalLoss + {ORDINAL_WEIGHT}xOrdinalLoss")
     print(f"  Features      : {NUM_FEATURES} (30 medical + 1 synthetic flag)")
     print(f"  Hard classes  : {HARD_CLASSES} → 3x sampler weight")
-    print(f"  MixUp         : adjacent-grade only, same-domain, starts ep20")
+    print(f"  MixUp         : adjacent-grade only, same-domain, starts ep40")
     print(f"  SWA start     : epoch {SWA_START}")
     print(f"  Backbone      : 1 stage unfrozen per {UNFREEZE_STEP} epochs")
     print(f"{'='*70}\n")
 
-    # Restore healthy LR if resuming mid-training
+    # Fresh scheduler on resume so LR starts healthy
     if start_epoch > 0:
+        sch = WarmCosine(opt, warmup=2, total=max(40, epochs - start_epoch), min_frac=0.15)
         for pg in opt.param_groups:
             pg['lr']      = lr * 0.5
             pg['base_lr'] = lr * 0.5
-        sch = WarmCosine(opt, warmup=3, total=max(40, epochs - start_epoch), min_frac=0.15)
-        print(f"  ✅ LR reset to {lr*0.5:.1e}, scheduler restarted for resume at epoch {start_epoch}")
+        print(f"  ✅ Scheduler restarted, LR={lr*0.5:.1e}")
 
     pat=0; unfrz=False
     ckpt = os.path.join(output_dir, 'best_model.pt')
@@ -897,7 +858,8 @@ def train(data_dir, output_dir, epochs=100, batch_size=32,
         print(f"Train  — loss:{tr_loss:.4f} | acc:{tr_acc:.2f}%")
         print(f"Val    — loss:{va_loss:.4f} | acc:{va_acc:.2f}%"
               f" | bal:{va_bacc:.2f}% | F1:{f1:.4f}{tags}")
-        print(f"LR     — head={lrs[1]:.2e} bb={lrs[0]:.2e} | alpha={alpha:.3f}")
+        lr_str = " | ".join([f"pg{i}={v:.2e}" for i,v in enumerate(lrs)])
+        print(f"LR     — {lr_str} | alpha={alpha:.3f}")
 
         for k,v in zip(['tr_loss','tr_acc','va_loss','va_acc','va_f1','va_bacc'],
                        [tr_loss,tr_acc,va_loss,va_acc,f1,va_bacc]):
