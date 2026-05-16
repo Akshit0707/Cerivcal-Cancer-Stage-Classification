@@ -741,6 +741,15 @@ def train(data_dir, output_dir, epochs=100, batch_size=32,
         if os.path.exists(ckpt_path):
             ck = torch.load(ckpt_path, map_location=device, weights_only=False)
             model.load_state_dict(ck['model_state_dict'])
+            if 'opt_state' in ck:
+                try:
+                    opt.load_state_dict(ck['opt_state'])
+                    print(f"  ✅ Optimizer state restored")
+                except Exception as e:
+                    print(f"  ⚠️  Could not restore optimizer state: {e}")
+            if 'sch_ep' in ck:
+                sch.ep = ck['sch_ep']
+                print(f"  ✅ Scheduler restored at ep={sch.ep}")
             start_epoch = ck.get('epoch', 0)
             best_f1     = ck.get('macro_f1', 0.)
             best_bacc   = ck.get('val_bacc', 0.)
@@ -762,7 +771,7 @@ def train(data_dir, output_dir, epochs=100, batch_size=32,
 
     # Create optimizer BEFORE the training loop
     opt = make_opt(lr * 0.01, lr)
-    sch = WarmCosine(opt, warmup=3, total=max(FREEZE_EPOCHS, epochs), min_frac=0.05)
+    sch = WarmCosine(opt, warmup=3, total=epochs, min_frac=0.05)
 
     # ── Loss ──────────────────────────────────────────────────────────────
     ce_fn  = FocalLoss(gamma=1.0, smoothing=0.08, num_classes=len(cls))
@@ -815,8 +824,8 @@ def train(data_dir, output_dir, epochs=100, batch_size=32,
                     pg['lr']      = lr * 0.5
                     pg['base_lr'] = lr * 0.5
             opt.param_groups[-1]['frozen_lr'] = True
-            remaining = max(30, epochs - ep)
-            sch = WarmCosine(opt, warmup=3, total=remaining, min_frac=0.10)
+            remaining = max(40, epochs - ep)
+            sch = WarmCosine(opt, warmup=3, total=remaining, min_frac=0.15)
             if USE_SWA:
                 swa_model = AveragedModel(model)
             print(f"  Added backbone params to optimizer (bb_lr={lr*0.005:.1e})")
@@ -877,6 +886,8 @@ def train(data_dir, output_dir, epochs=100, batch_size=32,
                 'version':          _VERSION,
                 'use_swa':          use_swa,
                 'severity_order':   SEVERITY_ORDER,
+                'sch_ep':           sch.ep,
+                'opt_state':        opt.state_dict(),
             }, ckpt)
             print(f"✅ Saved (F1={f1:.4f}, acc={va_acc:.2f}%, bal={va_bacc:.2f}%)")
         else:
