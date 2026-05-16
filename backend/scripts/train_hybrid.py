@@ -80,7 +80,7 @@ CE_WEIGHT       = 0.7
 SEVERITY_ORDER = ['Normal', 'CIN1', 'HighGrade', 'Cancer']
 
 # Classes that get 3x sampler weight (harder / less represented)
-HARD_CLASSES   = {'HighGrade', 'Cancer','Normal'}  # Normal is now abundant, so give it more weight to balance
+HARD_CLASSES   = {'HighGrade', 'Cancer', 'Normal'}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Path setup
@@ -112,12 +112,6 @@ def set_seed(seed=42):
 # ORDINAL LOSS
 # ─────────────────────────────────────────────────────────────────────────────
 class OrdinalLoss(nn.Module):
-    """
-    Cumulative-link ordinal regression loss.
-    For K ordered classes learns K-1 binary classifiers: P(Y >= k).
-    Gives partial credit: predicting CIN1 when truth=HighGrade is penalised
-    less than predicting Normal.
-    """
     def __init__(self, num_classes=4, smoothing=0.05):
         super().__init__()
         self.K = num_classes
@@ -221,7 +215,6 @@ class EfficientNetHybrid(nn.Module):
             nn.Linear(256, num_classes),
         )
 
-        # ordinal head: num_classes-1 = 3 thresholds
         self.ordinal_head = nn.Sequential(
             nn.Dropout(dropout*0.5),
             nn.Linear(fusion, 128), nn.GELU(),
@@ -304,7 +297,7 @@ def unfreeze_progressive(model, epoch, freeze_start):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Dataset — injects is_synthetic flag automatically from filename
+# Dataset
 # ─────────────────────────────────────────────────────────────────────────────
 class HybridDataset(Dataset):
     def __init__(self, paths, labels, transform=None, cache=None):
@@ -320,10 +313,7 @@ class HybridDataset(Dataset):
         img = Image.open(p).convert('RGB')
         if self.transform: img = self.transform(img)
 
-        # 30 medical features from cache
         med_feat = self.cache.get(p, np.zeros(NUM_FEATURES - 1, dtype=np.float32))
-
-        # 31st feature: 1.0 if synthetic (filename contains 'syn_'), else 0.0
         is_syn = 1.0 if 'syn_' in Path(p).name else 0.0
         feat   = np.append(med_feat, is_syn).astype(np.float32)
 
@@ -376,9 +366,10 @@ def tta_transforms(sz=300):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Class-constrained MixUp — only adjacent grades, never syn+real cross-class
+# MixUp — FIXED: unsqueeze(1) on mask for feature broadcasting
 # ─────────────────────────────────────────────────────────────────────────────
 def adjacent_mixup(images, features, labels, alpha=0.1):
+    """Mix only samples with |label_a - label_b| <= 1 AND same domain."""
     B   = images.size(0)
     lam = float(np.random.beta(alpha, alpha))
     lam = max(0.1, min(0.9, lam))
@@ -390,9 +381,9 @@ def adjacent_mixup(images, features, labels, alpha=0.1):
     mask     = (adj * same_dom).view(-1, 1, 1, 1)
 
     mixed_img  = mask*(lam*images + (1-lam)*images[perm]) + (1-mask)*images
-    # FIXED: unsqueeze(1) on both sides so shape is (B,1) broadcasting over (B,31)
+    # FIXED: use unsqueeze(1) so (B,1) broadcasts over (B,31)
     mixed_feat = mask.unsqueeze(1)*(lam*features + (1-lam)*features[perm]) + \
-                 (1-mask.unsqueeze(1))*features          # ← was mask.squeeze()
+                 (1-mask.unsqueeze(1))*features
     return mixed_img, mixed_feat, la, lb, lam, mask.squeeze()
 
 
@@ -598,7 +589,7 @@ def evaluate(model, loader, device, ce_fn, class_names,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Feature extraction (30 medical features only — syn flag added in Dataset)
+# Feature extraction
 # ─────────────────────────────────────────────────────────────────────────────
 def sanitize(arr):
     return np.clip(np.nan_to_num(np.array(arr,np.float32),
@@ -606,9 +597,8 @@ def sanitize(arr):
 
 
 def build_cache(paths, scaler=None, fit=False):
-    """Extract 30 medical features per image. Synthetic flag added in Dataset."""
     raw,nbad = {},0
-    N_MED = NUM_FEATURES - 1   # 30
+    N_MED = NUM_FEATURES - 1
     for p in tqdm(paths, desc="Features", leave=False):
         try:
             f = extract_medical_features(Image.open(p).convert('RGB'))
@@ -685,7 +675,6 @@ def train(data_dir, output_dir, epochs=100, batch_size=32,
             for i,n in enumerate(cls):
                 print(f"   {n}: train={tc[i]}  val={vc2[i]}")
     else:
-        # Flat folder: data_dir/ClassName/*.jpg
         cls = sorted([p.name for p in dp.iterdir()
                       if p.is_dir() and p.name not in
                       ('test','synthetic','sipakmed_raw','__pycache__')])
@@ -697,7 +686,6 @@ def train(data_dir, output_dir, epochs=100, batch_size=32,
     print(f"\n✅ Train: {len(tr_p)}  Val: {len(va_p)}")
     if not tr_p: raise ValueError("No training images found.")
 
-    # Remap to severity order
     sev_present = [c for c in SEVERITY_ORDER if c in cls]
     if set(sev_present) == set(cls):
         old2new = {cls.index(c): sev_present.index(c) for c in cls}
@@ -710,7 +698,6 @@ def train(data_dir, output_dir, epochs=100, batch_size=32,
         print(f"⚠️  Unknown classes {missing} — ordinal loss may be less effective.")
         print(f"   Expected: {SEVERITY_ORDER}")
 
-    # Synthetic image count report
     syn_tr = sum(1 for p in tr_p if 'syn_' in Path(p).name)
     syn_va = sum(1 for p in va_p if 'syn_' in Path(p).name)
     print(f"   Synthetic images — train: {syn_tr} ({100*syn_tr/max(1,len(tr_p)):.1f}%)"
@@ -727,7 +714,6 @@ def train(data_dir, output_dir, epochs=100, batch_size=32,
     va_ds = HybridDataset(va_p, va_l, val_transform(INPUT_SIZE),   va_cache)
     tta_t = tta_transforms(INPUT_SIZE) if USE_TTA else None
 
-    # Sampler: 3x weight for HighGrade and Cancer
     tc       = Counter(tr_l)
     hard_idx = {cls.index(c) for c in HARD_CLASSES if c in cls}
     sw       = [(1./tc[l])*(3. if l in hard_idx else 1.) for l in tr_l]
@@ -742,19 +728,22 @@ def train(data_dir, output_dir, epochs=100, batch_size=32,
     # ── Model ─────────────────────────────────────────────────────────────
     model = build_model(len(cls), NUM_FEATURES, device, dropout=0.3, dpr=0.2)
     freeze_backbone(model)
+
+    # ── Resume from checkpoint ────────────────────────────────────────────
     start_epoch = 0
-if resume:
-    ckpt_path = os.path.join(output_dir, 'best_model.pt')
-    if os.path.exists(ckpt_path):
-        ck = torch.load(ckpt_path, map_location=device)
-        model.load_state_dict(ck['model_state_dict'])
-        start_epoch = ck.get('epoch', 0)
-        best_f1     = ck.get('macro_f1', 0.)
-        best_bacc   = ck.get('val_bacc', 0.)
-        best_acc    = ck.get('val_acc',  0.)
-        print(f"▶️  Resumed from epoch {start_epoch}  F1={best_f1:.4f}  bal={best_bacc:.2f}%")
-    else:
-        print("⚠️  No checkpoint found — starting from scratch")
+    best_f1 = best_bacc = best_acc = 0.
+    if resume:
+        ckpt_path = os.path.join(output_dir, 'best_model.pt')
+        if os.path.exists(ckpt_path):
+            ck = torch.load(ckpt_path, map_location=device)
+            model.load_state_dict(ck['model_state_dict'])
+            start_epoch = ck.get('epoch', 0)
+            best_f1     = ck.get('macro_f1', 0.)
+            best_bacc   = ck.get('val_bacc', 0.)
+            best_acc    = ck.get('val_acc',  0.)
+            print(f"▶️  Resumed from epoch {start_epoch}  F1={best_f1:.4f}  bal={best_bacc:.2f}%")
+        else:
+            print("⚠️  No checkpoint found — starting from scratch")
 
     # ── Optimizer helpers ─────────────────────────────────────────────────
     bb_ids = {id(p) for p in model.backbone.parameters()}
@@ -789,7 +778,6 @@ if resume:
     print(f"  Backbone      : 1 stage unfrozen per {UNFREEZE_STEP} epochs")
     print(f"{'='*70}\n")
 
-    best_f1=best_bacc=best_acc=0.
     pat=0; unfrz=False
     ckpt = os.path.join(output_dir, 'best_model.pt')
     hist = {k:[] for k in ['tr_loss','tr_acc','va_loss','va_acc','va_f1','va_bacc']}
@@ -843,7 +831,7 @@ if resume:
                        [tr_loss,tr_acc,va_loss,va_acc,f1,va_bacc]):
             hist[k].append(v)
 
-        # Checkpoint — improved on F1 or balanced accuracy
+        # Checkpoint
         improved = (f1 > best_f1+5e-4) or \
                    (va_bacc > best_bacc+0.3 and f1 > best_f1-0.01) or \
                    (va_acc  > best_acc +0.5 and f1 > best_f1-0.005)
@@ -851,19 +839,19 @@ if resume:
             best_f1=f1; best_bacc=va_bacc; best_acc=va_acc; pat=0
             sm = swa_model if use_swa else model
             torch.save({
-                'epoch':         ep+1,
+                'epoch':            ep+1,
                 'model_state_dict': sm.state_dict(),
-                'val_acc':       va_acc,
-                'val_bacc':      va_bacc,
-                'macro_f1':      f1,
-                'class_names':   cls,
-                'num_classes':   len(cls),
-                'num_features':  NUM_FEATURES,
-                'feat_dim':      FEAT_DIM,
-                'input_size':    INPUT_SIZE,
-                'version':       _VERSION,
-                'use_swa':       use_swa,
-                'severity_order': SEVERITY_ORDER,
+                'val_acc':          va_acc,
+                'val_bacc':         va_bacc,
+                'macro_f1':         f1,
+                'class_names':      cls,
+                'num_classes':      len(cls),
+                'num_features':     NUM_FEATURES,
+                'feat_dim':         FEAT_DIM,
+                'input_size':       INPUT_SIZE,
+                'version':          _VERSION,
+                'use_swa':          use_swa,
+                'severity_order':   SEVERITY_ORDER,
             }, ckpt)
             print(f"✅ Saved (F1={f1:.4f}, acc={va_acc:.2f}%, bal={va_bacc:.2f}%)")
         else:
@@ -883,13 +871,13 @@ if resume:
         sp=os.path.join(output_dir,'swa_model.pt')
         torch.save({
             'model_state_dict': swa_model.state_dict(),
-            'class_names':   cls,
-            'num_classes':   len(cls),
-            'num_features':  NUM_FEATURES,
-            'feat_dim':      FEAT_DIM,
-            'input_size':    INPUT_SIZE,
-            'version':       _VERSION,
-            'severity_order': SEVERITY_ORDER,
+            'class_names':      cls,
+            'num_classes':      len(cls),
+            'num_features':     NUM_FEATURES,
+            'feat_dim':         FEAT_DIM,
+            'input_size':       INPUT_SIZE,
+            'version':          _VERSION,
+            'severity_order':   SEVERITY_ORDER,
         }, sp)
         print(f"  SWA saved: {sp}")
         if sf>best_f1 or sb>best_bacc:
@@ -922,8 +910,8 @@ if __name__ == '__main__':
     parser.add_argument('--no-swa',    action='store_true')
     parser.add_argument('--use-sam',   action='store_true')
     parser.add_argument('--no-cutmix', action='store_true')
-    parser.add_argument('--resume', action='store_true',
-                    help='Resume from best_model.pt in checkpoint-dir')
+    parser.add_argument('--resume',    action='store_true',
+                        help='Resume training from best_model.pt in checkpoint-dir')
     args = parser.parse_args()
 
     if args.no_tta:    USE_TTA    = False
@@ -948,5 +936,5 @@ if __name__ == '__main__':
         lr          = args.learning_rate,
         patience    = args.early_stopping_patience,
         num_workers = args.num_workers,
-         resume = args.resume,
+        resume      = args.resume,
     )
