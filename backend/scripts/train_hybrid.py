@@ -86,7 +86,12 @@ class OrdinalLoss(nn.Module):
         bt = torch.zeros(B, K1, device=targets.device)
         for k in range(1, self.K):
             bt[:, k-1] = (targets >= k).float()
-        bt = bt*(1-self.s) + (1-bt)*self.s
+        # Scale smoothing by distance from boundary to penalize distant errors more lightly
+        dist = torch.zeros_like(bt)
+        for k in range(1, self.K):
+            dist[:, k-1] = torch.abs(targets.float() - k)
+        scale = 1. - self.s * (1. / (1. + dist))
+        bt = bt * scale + (1 - bt) * (1 - scale)
         return F.binary_cross_entropy_with_logits(logits, bt)
 
 
@@ -294,16 +299,15 @@ def val_transform(sz=300):
 
 
 def tta_transforms(sz=300):
+    transforms_list = [val_transform(sz)]  # base (no aug) — kept in sync automatically
     n = transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
-    r = [transforms.Resize((sz,sz),interpolation=transforms.InterpolationMode.BICUBIC),
-         transforms.ToTensor(), n]
-    return [
-        transforms.Compose(r),
-        transforms.Compose([transforms.RandomHorizontalFlip(1.)]+r),
-        transforms.Compose([transforms.RandomVerticalFlip(1.)]+r),
-        transforms.Compose([transforms.RandomRotation((90,90))]+r),
-        transforms.Compose([transforms.RandomRotation((180,180))]+r),
+    transforms_list += [
+        transforms.Compose([transforms.RandomHorizontalFlip(1.), transforms.Resize((sz,sz), interpolation=transforms.InterpolationMode.BICUBIC), transforms.ToTensor(), n]),
+        transforms.Compose([transforms.RandomVerticalFlip(1.),   transforms.Resize((sz,sz), interpolation=transforms.InterpolationMode.BICUBIC), transforms.ToTensor(), n]),
+        transforms.Compose([transforms.RandomRotation((90,90)),  transforms.Resize((sz,sz), interpolation=transforms.InterpolationMode.BICUBIC), transforms.ToTensor(), n]),
+        transforms.Compose([transforms.RandomRotation((180,180)),transforms.Resize((sz,sz), interpolation=transforms.InterpolationMode.BICUBIC), transforms.ToTensor(), n]),
     ]
+    return transforms_list
 
 
 def adjacent_mixup(images, features, labels, alpha=0.1):
@@ -361,7 +365,7 @@ class WarmCosine:
             prog = (e - self.warmup) / max(1, self.total - self.warmup)
             s = self.min_f + 0.5*(1-self.min_f)*(1+math.cos(math.pi*prog))
         for pg in self.opt.param_groups:
-            if not pg.get('frozen_lr', False):
+            if not pg.get('frozen_lr', False):  # frozen_lr=True means backbone LR is held constant intentionally
                 pg['lr'] = pg['base_lr'] * s
 
     def lrs(self):
@@ -426,7 +430,7 @@ def train_epoch(model, loader, opt, ce_fn, ord_fn, device, scaler, epoch):
             if lam < 1.:
                 if adj_mask is not None:
                     ce = lam*ce_fn(logits,la) + (1-lam)*ce_fn(logits,lb)
-                    ol = ord_fn(ord_logits, la)
+                    ol = lam*ord_fn(ord_logits, la) + (1-lam)*ord_fn(ord_logits, lb)
                 else:
                     ce = lam*ce_fn(logits,la) + (1-lam)*ce_fn(logits,lb)
                     ol = lam*ord_fn(ord_logits,la) + (1-lam)*ord_fn(ord_logits,lb)
@@ -532,7 +536,8 @@ def build_cache(paths, scaler=None, fit=False):
         print(f"  ⚠️  {nbad} ({pct:.1f}%) feature failures")
         if pct>30: print("  ❌  >30% failures — check feature_extractor!")
 
-    sample = np.concatenate([raw[p] for p in list(raw)[:10]])
+    sample_keys = random.sample(list(raw), min(50, len(raw)))
+    sample = np.concatenate([raw[p] for p in sample_keys])
     if np.allclose(sample,0.):
         print("  ❌  CRITICAL: all features zero!")
     else:
@@ -739,9 +744,16 @@ def train(data_dir, output_dir, epochs=100, batch_size=32,
                     pg['base_lr'] = lr * 0.5
             if USE_SWA:
                 swa_model = AveragedModel(model)
-            print(f"  Backbone unfrozen, bb_lr={lr*0.005:.1e}, head_lr={lr*0.5:.1e}")
+                print("  ✅ SWA model reset after resume")
+            print(f"  ✅ Scheduler restarted, head_lr={lr*0.5:.1e}")
         elif unfrz and ep > FREEZE_EPOCHS:
             unfreeze_progressive(model, ep, FREEZE_EPOCHS)
+            already = {id(p) for pg in opt.param_groups for p in pg['params']}
+            new_params = [p for p in model.backbone.parameters()
+                          if p.requires_grad and id(p) not in already]
+            if new_params:
+                bb_group = next(pg for pg in opt.param_groups if pg.get('frozen_lr'))
+                bb_group['params'].extend(new_params)
 
         tr_loss, tr_acc = train_epoch(
             model, tr_loader, opt, ce_fn, ord_fn, device, amp_scaler, ep)
@@ -756,6 +768,9 @@ def train(data_dir, output_dir, epochs=100, batch_size=32,
         do_tta  = USE_TTA and (ep+1)%TTA_EVERY==0
         verbose = True
         eval_m  = swa_model if use_swa else model
+
+        if use_swa and ep == SWA_START:
+            print("  ℹ️  SWA active: val metrics now from averaged model; train loss from base model (not directly comparable)")
 
         va_acc,va_bacc,va_loss,f1,_,_ = evaluate(
             eval_m, va_loader, device, ce_fn, cls,
