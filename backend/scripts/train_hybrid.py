@@ -755,14 +755,6 @@ def train(data_dir, output_dir, epochs=100, batch_size=32,
             best_bacc   = ck.get('val_bacc', 0.)
             best_acc    = ck.get('val_acc',  0.)
             print(f"▶️  Resumed from epoch {start_epoch}  F1={best_f1:.4f}  bal={best_bacc:.2f}%")
-            # Force LR to a healthy value regardless of saved state
-            resumed_ep = ck.get('epoch', 0)
-            for pg in opt.param_groups:
-                pg['lr']      = lr * 0.5
-                pg['base_lr'] = lr * 0.5
-            # Reset scheduler from resumed epoch so it doesn't start expired
-            sch.ep = resumed_ep
-            print(f"  ✅ LR reset to {lr*0.5:.1e} for all param groups")
         else:
             print("⚠️  No checkpoint found — starting from scratch")
 
@@ -777,9 +769,34 @@ def train(data_dir, output_dir, epochs=100, batch_size=32,
             {'params': head_p, 'lr': hd_lr, 'weight_decay': 1e-4},
         ])
 
-    # Create optimizer BEFORE the training loop
+    # Create optimizer BEFORE the resume block
     opt = make_opt(lr * 0.01, lr)
     sch = WarmCosine(opt, warmup=3, total=epochs, min_frac=0.05)
+
+    # ── Resume from checkpoint ────────────────────────────────────────────
+    start_epoch = 0
+    best_f1 = best_bacc = best_acc = 0.
+    if resume:
+        ckpt_path = os.path.join(output_dir, 'best_model.pt')
+        if os.path.exists(ckpt_path):
+            ck = torch.load(ckpt_path, map_location=device, weights_only=False)
+            model.load_state_dict(ck['model_state_dict'])
+            if 'opt_state' in ck:
+                try:
+                    opt.load_state_dict(ck['opt_state'])
+                    print(f"  ✅ Optimizer state restored")
+                except Exception as e:
+                    print(f"  ⚠️  Could not restore optimizer state: {e}")
+            if 'sch_ep' in ck:
+                sch.ep = ck['sch_ep']
+                print(f"  ✅ Scheduler restored at ep={sch.ep}")
+            start_epoch = ck.get('epoch', 0)
+            best_f1     = ck.get('macro_f1', 0.)
+            best_bacc   = ck.get('val_bacc', 0.)
+            best_acc    = ck.get('val_acc',  0.)
+            print(f"▶️  Resumed from epoch {start_epoch}  F1={best_f1:.4f}  bal={best_bacc:.2f}%")
+        else:
+            print("⚠️  No checkpoint found — starting from scratch")
 
     # ── Loss ──────────────────────────────────────────────────────────────
     ce_fn  = FocalLoss(gamma=1.0, smoothing=0.08, num_classes=len(cls))
@@ -799,6 +816,14 @@ def train(data_dir, output_dir, epochs=100, batch_size=32,
     print(f"  SWA start     : epoch {SWA_START}")
     print(f"  Backbone      : 1 stage unfrozen per {UNFREEZE_STEP} epochs")
     print(f"{'='*70}\n")
+
+    # Restore healthy LR if resuming mid-training
+    if start_epoch > 0:
+        for pg in opt.param_groups:
+            pg['lr']      = lr * 0.5
+            pg['base_lr'] = lr * 0.5
+        sch.ep = start_epoch
+        print(f"  ✅ LR reset to {lr*0.5:.1e} for resume at epoch {start_epoch}")
 
     pat=0; unfrz=False
     ckpt = os.path.join(output_dir, 'best_model.pt')
