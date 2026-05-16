@@ -379,23 +379,20 @@ def tta_transforms(sz=300):
 # Class-constrained MixUp — only adjacent grades, never syn+real cross-class
 # ─────────────────────────────────────────────────────────────────────────────
 def adjacent_mixup(images, features, labels, alpha=0.1):
-    """Mix only samples with |label_a - label_b| <= 1 AND same domain."""
     B   = images.size(0)
     lam = float(np.random.beta(alpha, alpha))
     lam = max(0.1, min(0.9, lam))
     perm = torch.randperm(B, device=images.device)
     la, lb = labels, labels[perm]
 
-    # adjacent grade mask
-    adj = (torch.abs(la.float()-lb.float()) <= 1).float()
-    # same domain mask (both real or both synthetic — last feature is the flag)
+    adj      = (torch.abs(la.float()-lb.float()) <= 1).float()
     same_dom = (features[:, -1] == features[perm, -1]).float()
-    mask = (adj * same_dom).view(-1,1,1,1)
+    mask     = (adj * same_dom).view(-1, 1, 1, 1)
 
     mixed_img  = mask*(lam*images + (1-lam)*images[perm]) + (1-mask)*images
-    # FIXED
+    # FIXED: unsqueeze(1) on both sides so shape is (B,1) broadcasting over (B,31)
     mixed_feat = mask.unsqueeze(1)*(lam*features + (1-lam)*features[perm]) + \
-                 (1-mask.squeeze())*features
+                 (1-mask.unsqueeze(1))*features          # ← was mask.squeeze()
     return mixed_img, mixed_feat, la, lb, lam, mask.squeeze()
 
 
