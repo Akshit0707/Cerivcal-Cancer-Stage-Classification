@@ -757,8 +757,9 @@ def train(data_dir, output_dir, epochs=100, batch_size=32,
             {'params': head_p, 'lr': hd_lr, 'weight_decay': 1e-4},
         ])
 
-        opt = make_opt(lr * 0.01, lr)   # was lr*0.05 → try lr*0.01
-        sch = WarmCosine(opt, warmup=2, total=epochs-ep, min_frac=0.03)
+    # Create optimizer BEFORE the training loop
+    opt = make_opt(lr * 0.01, lr)
+    sch = WarmCosine(opt, warmup=2, total=epochs-start_epoch, min_frac=0.03)
 
     # ── Loss ──────────────────────────────────────────────────────────────
     ce_fn  = FocalLoss(gamma=1.0, smoothing=0.08, num_classes=len(cls))
