@@ -793,12 +793,18 @@ def train(data_dir, output_dir, epochs=100, batch_size=32,
         if not unfrz and ep >= FREEZE_EPOCHS:
             unfrz = True
             unfreeze_progressive(model, ep, FREEZE_EPOCHS)
-            # Update backbone LR in existing param group instead of adding
-            opt.param_groups[0]['lr'] = lr * 0.005
+            
+            # Recreate optimizer with updated backbone parameters
+            bb_ids = {id(p) for p in model.backbone.parameters()}
+            head_p = [p for p in model.parameters() if id(p) not in bb_ids]
+            back_p = list(model.backbone.parameters())
+            
+            opt = make_opt(lr * 0.01, lr)  # Recreate with unfrozen backbone
             sch = WarmCosine(opt, warmup=2, total=epochs-ep, min_frac=0.03)
+            
             if USE_SWA:
                 swa_model = AveragedModel(model)
-            print(f"  Added backbone params to optimizer (bb_lr={lr*0.005:.1e})")
+            print(f"  Unfrozen backbone — recreated optimizer (bb_lr={lr*0.01:.1e})")
         elif unfrz and ep > FREEZE_EPOCHS:
             unfreeze_progressive(model, ep, FREEZE_EPOCHS)
 
@@ -844,7 +850,7 @@ def train(data_dir, output_dir, epochs=100, batch_size=32,
             sm = swa_model if use_swa else model
             torch.save({
                 'epoch':            ep+1,
-                'model_state_dict': sm.state_dict(),
+                'model_state_dict': sm.module.state_dict() if use_swa else sm.state_dict(),
                 'val_acc':          va_acc,
                 'val_bacc':         va_bacc,
                 'macro_f1':         f1,
@@ -874,7 +880,7 @@ def train(data_dir, output_dir, epochs=100, batch_size=32,
         print(f"  SWA final — acc={sa:.2f}% bal={sb:.2f}% F1={sf:.4f}")
         sp=os.path.join(output_dir,'swa_model.pt')
         torch.save({
-            'model_state_dict': swa_model.state_dict(),
+            'model_state_dict': swa_model.module.state_dict(),
             'class_names':      cls,
             'num_classes':      len(cls),
             'num_features':     NUM_FEATURES,
