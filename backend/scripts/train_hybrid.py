@@ -759,7 +759,7 @@ def train(data_dir, output_dir, epochs=100, batch_size=32,
 
     # Create optimizer BEFORE the training loop
     opt = make_opt(lr * 0.01, lr)
-    sch = WarmCosine(opt, warmup=2, total=epochs-start_epoch, min_frac=0.03)
+    sch = WarmCosine(opt, warmup=3, total=FREEZE_EPOCHS, min_frac=0.05)
 
     # ── Loss ──────────────────────────────────────────────────────────────
     ce_fn  = FocalLoss(gamma=1.0, smoothing=0.08, num_classes=len(cls))
@@ -794,7 +794,7 @@ def train(data_dir, output_dir, epochs=100, batch_size=32,
             unfrz = True
             unfreeze_progressive(model, ep, FREEZE_EPOCHS)
             opt.add_param_group({
-                'params': [p for p in model.backbone.parameters() if p.requires_grad],
+                'params': back_p,
                 'lr': lr * 0.005,
                 'weight_decay': 1e-4,
             })
