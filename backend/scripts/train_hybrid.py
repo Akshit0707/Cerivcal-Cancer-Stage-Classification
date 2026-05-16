@@ -393,7 +393,8 @@ def adjacent_mixup(images, features, labels, alpha=0.1):
     mask = (adj * same_dom).view(-1,1,1,1)
 
     mixed_img  = mask*(lam*images + (1-lam)*images[perm]) + (1-mask)*images
-    mixed_feat = mask.squeeze()*(lam*features + (1-lam)*features[perm]) + \
+    # FIXED
+    mixed_feat = mask.unsqueeze(1)*(lam*features + (1-lam)*features[perm]) + \
                  (1-mask.squeeze())*features
     return mixed_img, mixed_feat, la, lb, lam, mask.squeeze()
 
