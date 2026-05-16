@@ -780,7 +780,7 @@ def train(data_dir, output_dir, epochs=100, batch_size=32,
 
     # Fresh scheduler on resume so LR starts healthy
     if start_epoch > 0:
-        sch = WarmCosine(opt, warmup=2, total=max(40, epochs - start_epoch), min_frac=0.15)
+        sch = WarmCosine(opt, warmup=2, total=max(60, epochs - start_epoch), min_frac=0.20)
         for pg in opt.param_groups:
             pg['lr']      = lr * 0.5
             pg['base_lr'] = lr * 0.5
