@@ -755,6 +755,14 @@ def train(data_dir, output_dir, epochs=100, batch_size=32,
             best_bacc   = ck.get('val_bacc', 0.)
             best_acc    = ck.get('val_acc',  0.)
             print(f"▶️  Resumed from epoch {start_epoch}  F1={best_f1:.4f}  bal={best_bacc:.2f}%")
+            # Force LR to a healthy value regardless of saved state
+            resumed_ep = ck.get('epoch', 0)
+            for pg in opt.param_groups:
+                pg['lr']      = lr * 0.5
+                pg['base_lr'] = lr * 0.5
+            # Reset scheduler from resumed epoch so it doesn't start expired
+            sch.ep = resumed_ep
+            print(f"  ✅ LR reset to {lr*0.5:.1e} for all param groups")
         else:
             print("⚠️  No checkpoint found — starting from scratch")
 
@@ -829,6 +837,11 @@ def train(data_dir, output_dir, epochs=100, batch_size=32,
             if USE_SWA:
                 swa_model = AveragedModel(model)
             print(f"  Added backbone params to optimizer (bb_lr={lr*0.005:.1e})")
+            # Force head LR back to healthy value after adding backbone group
+            for pg in opt.param_groups[:-1]:
+                pg['lr']      = lr * 0.5
+                pg['base_lr'] = lr * 0.5
+            sch.ep = ep  # reset scheduler position to current epoch
         elif unfrz and ep > FREEZE_EPOCHS:
             unfreeze_progressive(model, ep, FREEZE_EPOCHS)
 
