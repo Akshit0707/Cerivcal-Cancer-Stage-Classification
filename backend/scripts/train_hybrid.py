@@ -735,7 +735,7 @@ def train(data_dir, output_dir, epochs=100, batch_size=32,
     if resume:
         ckpt_path = os.path.join(output_dir, 'best_model.pt')
         if os.path.exists(ckpt_path):
-            ck = torch.load(ckpt_path, map_location=device)
+            ck = torch.load(ckpt_path, map_location=device, weights_only=False)
             model.load_state_dict(ck['model_state_dict'])
             start_epoch = ck.get('epoch', 0)
             best_f1     = ck.get('macro_f1', 0.)
