@@ -553,7 +553,7 @@ def build_cache(paths, scaler=None, fit=False):
     return cache, scaler
 
 
-def train(data_dir, output_dir, epochs=100, batch_size=32,
+def train(data_dir, output_dir, epochs=50, batch_size=32,
           lr=2e-4, patience=20, num_workers=4, resume=False):
     set_seed(42)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
