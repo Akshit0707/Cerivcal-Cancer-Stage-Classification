@@ -1,321 +1,382 @@
 """
-Hybrid Model for Cervical Cancer Classification
-Architecture reverse-engineered from actual checkpoint state-dict shapes.
+model.py — EfficientNetHybrid v11
+Architecture aligned with train_hybrid.py (SIPaKMeD + Herlev | 4-class ordinal).
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-VERIFIED checkpoint architecture (all dims read from weight shapes):
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Key architecture facts
+───────────────────────────────────────────────────────────────────────
+  NUM_FEATURES  = 31  (30 medical dims + 1 synthetic flag)
+  INPUT_SIZE    = 300
+  FEAT_DIM      = 128  (FeatureMLP output)
+  CNN_DIM       = 1536 (EfficientNet-B3 pool output)
+  FUSION_DIM    = 1664 (CNN_DIM + FEAT_DIM)
 
-  FeatureMLP  (3-block, indices 0-9 in net):
-    net.0  Linear(30  -> 256)   [256, 30]
+  FeatureMLP  (gate-gated, state-dict prefix: feat_mlp)
+    net.0  Linear(31  -> 256)
     net.1  BN(256)
     net.2  GELU
-    net.3  Dropout(0.3)
-    net.4  Linear(256 -> 256)   [256, 256]
+    net.3  Dropout(0.25)
+    net.4  Linear(256 -> 256)
     net.5  BN(256)
     net.6  GELU
-    net.7  Dropout(0.15)
-    net.8  Linear(256 -> 128)   [128, 256]   <- final reduction
+    net.7  Dropout(0.125)
+    net.8  Linear(256 -> 128)
     net.9  BN(128)
-    proj   Linear(30  -> 128)   [128, 30]
-    forward: net(x) + proj(x)  -> 128-dim
+    gate.0 Linear(31  -> 32)
+    gate.1 ReLU
+    gate.2 Linear(32  -> 1)
+    gate.3 Sigmoid
+    forward: net(x) * gate(x)   ← gated, NOT residual
 
-  fusion_dim = 1536 (EfficientNet-B3) + 128 = 1664
+  ChannelSE  (state-dict prefix: se)
+    fc.0  Linear(1664 -> 104)  [max(8, 1664//16)]
+    fc.1  ReLU
+    fc.2  Linear(104  -> 1664)
+    fc.3  Sigmoid
+    forward: x * fc(x)
 
-  attention  (NO Dropout, indices 0-3):
-    attention.0  Linear(1664 -> 64)
-    attention.1  GELU
-    attention.2  Linear(64   -> 2)
-    attention.3  Softmax(dim=-1)
+  head  (3-linear, state-dict prefix: head)
+    head.0  Dropout(0.5)
+    head.1  Linear(1664 -> 512)
+    head.2  BN(512)
+    head.3  GELU
+    head.4  Dropout(0.25)
+    head.5  Linear(512  -> 256)
+    head.6  BN(256)
+    head.7  GELU
+    head.8  Dropout(0.125)
+    head.9  Linear(256  -> num_classes)
 
-  classifier (indices 0-5):
-    classifier.0  Dropout(0.5)
-    classifier.1  Linear(1664 -> 512)
-    classifier.2  BN(512)
-    classifier.3  GELU
-    classifier.4  Dropout(0.25)
-    classifier.5  Linear(512 -> num_classes)
+  ordinal_head  (state-dict prefix: ordinal_head)
+    ordinal_head.0  Dropout(0.25)
+    ordinal_head.1  Linear(1664 -> 128)
+    ordinal_head.2  GELU
+    ordinal_head.3  Linear(128  -> num_classes-1)
+
+  forward(images, features, return_ordinal=True):
+    if return_ordinal: return logits, ord_logits
+    else:              return logits
 """
 
-import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import models
 
+# ── Shared constants (mirror train_hybrid.py) ─────────────────────────────────
+NUM_FEATURES   = 31     # 30 medical + 1 synthetic flag
+INPUT_SIZE     = 300
+FEAT_DIM       = 128
+CNN_DIM        = 1536   # EfficientNet-B3 pool output
+FUSION_DIM     = CNN_DIM + FEAT_DIM   # 1664
+SEVERITY_ORDER = ['Normal', 'CIN1', 'HighGrade', 'Cancer']
 
-# ---------------------------------------------------------------------------
-# FeatureMLP  -- 3-block, verified against checkpoint
-# ---------------------------------------------------------------------------
+
+# ── FeatureMLP ────────────────────────────────────────────────────────────────
+
 class FeatureMLP(nn.Module):
     """
-    Three-linear-block MLP with a residual projection.
+    Gate-gated MLP: output = net(x) * gate(x)
 
-    Default dims match the saved checkpoint:
-      in_dim=30, hidden1=256, hidden2=256, out_dim=128
-
-    Sequential index map (state-dict key alignment):
-      net.0  Linear(in_dim  -> hidden1)
-      net.1  BN(hidden1)
+    State-dict key map (matches train_hybrid.py exactly):
+      net.0  Linear(in_dim -> 256)
+      net.1  BN(256)
       net.2  GELU
-      net.3  Dropout(dropout)
-      net.4  Linear(hidden1 -> hidden2)
-      net.5  BN(hidden2)
+      net.3  Dropout(dropout)          [0.25 by default]
+      net.4  Linear(256 -> 256)
+      net.5  BN(256)
       net.6  GELU
-      net.7  Dropout(dropout * 0.5)
-      net.8  Linear(hidden2 -> out_dim)
+      net.7  Dropout(dropout*0.5)      [0.125]
+      net.8  Linear(256 -> out_dim)
       net.9  BN(out_dim)
-      proj   Linear(in_dim  -> out_dim)   [always, since in_dim != out_dim]
+      gate.0 Linear(in_dim -> 32)
+      gate.1 ReLU
+      gate.2 Linear(32 -> 1)
+      gate.3 Sigmoid
     """
 
-    def __init__(
-        self,
-        in_dim:  int   = 30,
-        out_dim: int   = 128,
-        hidden1: int   = 256,
-        hidden2: int   = 256,
-        dropout: float = 0.3,
-    ):
+    def __init__(self, in_dim: int = 31, out_dim: int = 128, dropout: float = 0.25):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(in_dim,  hidden1),   # net.0
-            nn.BatchNorm1d(hidden1),        # net.1
-            nn.GELU(),                      # net.2
-            nn.Dropout(dropout),            # net.3
-            nn.Linear(hidden1, hidden2),   # net.4
-            nn.BatchNorm1d(hidden2),        # net.5
-            nn.GELU(),                      # net.6
-            nn.Dropout(dropout * 0.5),      # net.7
-            nn.Linear(hidden2, out_dim),   # net.8
-            nn.BatchNorm1d(out_dim),        # net.9
+            nn.Linear(in_dim, 256),     # net.0
+            nn.BatchNorm1d(256),        # net.1
+            nn.GELU(),                  # net.2
+            nn.Dropout(dropout),        # net.3
+            nn.Linear(256, 256),        # net.4
+            nn.BatchNorm1d(256),        # net.5
+            nn.GELU(),                  # net.6
+            nn.Dropout(dropout * 0.5),  # net.7
+            nn.Linear(256, out_dim),    # net.8
+            nn.BatchNorm1d(out_dim),    # net.9
         )
-        self.proj = (
-            nn.Linear(in_dim, out_dim)
-            if in_dim != out_dim
-            else nn.Identity()
+        self.gate = nn.Sequential(
+            nn.Linear(in_dim, 32),      # gate.0
+            nn.ReLU(),                  # gate.1
+            nn.Linear(32, 1),           # gate.2
+            nn.Sigmoid(),               # gate.3
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x) + self.proj(x)
+        return self.net(x) * self.gate(x)
 
 
-# ---------------------------------------------------------------------------
-# DropPath  -- used only in _inject_drop_path
-# ---------------------------------------------------------------------------
-class DropPath(nn.Module):
-    def __init__(self, drop_prob: float = 0.):
+# ── ChannelSE ─────────────────────────────────────────────────────────────────
+
+class ChannelSE(nn.Module):
+    """
+    Squeeze-and-Excitation on the fused 1-D feature vector.
+
+    State-dict key map:
+      fc.0  Linear(dim -> max(8, dim//r))
+      fc.1  ReLU
+      fc.2  Linear(max(8, dim//r) -> dim)
+      fc.3  Sigmoid
+    """
+
+    def __init__(self, dim: int, r: int = 16):
         super().__init__()
-        self.drop_prob = drop_prob
+        mid = max(8, dim // r)
+        self.fc = nn.Sequential(
+            nn.Linear(dim, mid),   # fc.0
+            nn.ReLU(inplace=True), # fc.1
+            nn.Linear(mid, dim),   # fc.2
+            nn.Sigmoid(),          # fc.3
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.drop_prob == 0. or not self.training:
-            return x
-        keep_prob = 1 - self.drop_prob
-        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
-        rt = torch.rand(shape, dtype=x.dtype, device=x.device)
-        return x / keep_prob * torch.floor(rt + keep_prob)
+        return x * self.fc(x)
 
 
-# ---------------------------------------------------------------------------
-# EfficientNetHybrid
-# ---------------------------------------------------------------------------
+# ── EfficientNetHybrid ────────────────────────────────────────────────────────
+
 class EfficientNetHybrid(nn.Module):
     """
-    EfficientNet-B3 backbone + 3-block FeatureMLP, fused via attention.
-    All dims default to the saved checkpoint values.
+    EfficientNet-B3 backbone + FeatureMLP fused via ChannelSE,
+    with a 3-linear classification head and a separate ordinal head.
+
+    Matches train_hybrid.py v11 exactly.
     """
 
     def __init__(
         self,
-        num_classes:    int   = 5,
-        num_features:   int   = 30,
-        feat_out_dim:   int   = 128,   # FeatureMLP output dim
-        mlp_hidden1:    int   = 256,
-        mlp_hidden2:    int   = 256,
-        attn_hidden:    int   = 64,
-        attn_dropout:   bool  = False, # True adds Dropout(0.1) inside attention
-        dropout:        float = 0.5,
+        num_classes:    int   = 4,    # 4-class ordinal: Normal/CIN1/HighGrade/Cancer
+        num_features:   int   = NUM_FEATURES,   # 31
+        feat_dim:       int   = FEAT_DIM,       # 128
+        dropout:        float = 0.3,
         drop_path_rate: float = 0.2,
     ):
         super().__init__()
         self.num_classes  = num_classes
         self.num_features = num_features
 
-        # -- Backbone -------------------------------------------------------
-        backbone = models.efficientnet_b3(
-            weights=models.EfficientNet_B3_Weights.IMAGENET1K_V1
-        )
-        self.cnn_out_dim = backbone.classifier[1].in_features  # 1536
-        backbone.classifier = nn.Identity()
-        self._inject_drop_path(backbone, drop_path_rate)
-        self.backbone = backbone
-
-        # -- FeatureMLP -----------------------------------------------------
-        self.feature_mlp = FeatureMLP(
-            in_dim  = num_features,
-            out_dim = feat_out_dim,
-            hidden1 = mlp_hidden1,
-            hidden2 = mlp_hidden2,
-            dropout = 0.3,
-        )
-
-        fusion_dim = self.cnn_out_dim + feat_out_dim  # 1536 + 128 = 1664
-
-        # -- Attention gate -------------------------------------------------
-        # Checkpoint has NO Dropout: Linear->GELU->Linear->Softmax (idx 0-3)
-        # attn_dropout=True adds Dropout at idx 2, shifting Linear to idx 3
-        if attn_dropout:
-            self.attention = nn.Sequential(
-                nn.Linear(fusion_dim, attn_hidden),  # .0
-                nn.GELU(),                            # .1
-                nn.Dropout(0.1),                      # .2
-                nn.Linear(attn_hidden, 2),            # .3
-                nn.Softmax(dim=-1),                   # .4
-            )
-        else:
-            self.attention = nn.Sequential(
-                nn.Linear(fusion_dim, attn_hidden),  # .0
-                nn.GELU(),                            # .1
-                nn.Linear(attn_hidden, 2),            # .2
-                nn.Softmax(dim=-1),                   # .3
-            )
-
-        # -- Classifier -----------------------------------------------------
-        self.classifier = nn.Sequential(
-            nn.Dropout(dropout),           # .0
-            nn.Linear(fusion_dim, 512),    # .1
-            nn.BatchNorm1d(512),           # .2
-            nn.GELU(),                     # .3
-            nn.Dropout(dropout * 0.5),     # .4
-            nn.Linear(512, num_classes),   # .5
-        )
-
-    def _inject_drop_path(self, backbone, rate: float) -> None:
+        # ── Backbone ───────────────────────────────────────────────────────
         try:
-            blocks = list(backbone.features.children())
+            from torchvision.models import efficientnet_b3, EfficientNet_B3_Weights
+            bb = efficientnet_b3(weights=EfficientNet_B3_Weights.IMAGENET1K_V1)
+            self.cnn_dim = bb.classifier[1].in_features   # 1536
+            bb.classifier = nn.Identity()
+            self._set_drop_path(bb, drop_path_rate)
+            self.backbone = bb
+        except Exception:
+            # Fallback to ResNet-50 if EfficientNet unavailable
+            from torchvision.models import resnet50, ResNet50_Weights
+            bb = resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)
+            self.cnn_dim = bb.fc.in_features
+            bb.fc = nn.Identity()
+            self.backbone = bb
+
+        # ── Feature MLP (note: attribute name is feat_mlp) ────────────────
+        self.feat_mlp = FeatureMLP(num_features, feat_dim, dropout=0.25)
+
+        fusion = self.cnn_dim + feat_dim   # 1536 + 128 = 1664
+
+        # ── Channel Squeeze-and-Excitation ────────────────────────────────
+        self.se = ChannelSE(fusion, r=16)
+
+        # ── Classification head (3 linear layers) ─────────────────────────
+        self.head = nn.Sequential(
+            nn.Dropout(dropout),           # head.0
+            nn.Linear(fusion, 512),        # head.1
+            nn.BatchNorm1d(512),           # head.2
+            nn.GELU(),                     # head.3
+            nn.Dropout(dropout * 0.5),     # head.4
+            nn.Linear(512, 256),           # head.5
+            nn.BatchNorm1d(256),           # head.6
+            nn.GELU(),                     # head.7
+            nn.Dropout(dropout * 0.25),    # head.8
+            nn.Linear(256, num_classes),   # head.9
+        )
+
+        # ── Ordinal head (parallel branch) ────────────────────────────────
+        self.ordinal_head = nn.Sequential(
+            nn.Dropout(dropout * 0.5),         # ordinal_head.0
+            nn.Linear(fusion, 128),            # ordinal_head.1
+            nn.GELU(),                         # ordinal_head.2
+            nn.Linear(128, num_classes - 1),   # ordinal_head.3
+        )
+
+        self._init_weights()
+
+    # ── Weight initialisation ──────────────────────────────────────────────
+    def _init_weights(self):
+        for m in list(self.head.modules()) + list(self.ordinal_head.modules()):
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    # ── Stochastic depth ──────────────────────────────────────────────────
+    def _set_drop_path(self, bb, rate: float) -> None:
+        try:
+            blocks = list(bb.features.children())
             n = sum(1 for s in blocks if hasattr(s, '__iter__') for _ in s)
-            dp_rates = torch.linspace(0, rate, max(n, 1)).tolist()
-            idx = 0
-            for stage in blocks:
-                if not hasattr(stage, '__iter__'):
+            rates = torch.linspace(0, rate, max(n, 1)).tolist()
+            i = 0
+            for s in blocks:
+                if not hasattr(s, '__iter__'):
                     continue
-                for block in stage:
-                    if hasattr(block, 'stochastic_depth'):
-                        block.stochastic_depth.p = dp_rates[idx]
-                    idx += 1
+                for b in s:
+                    if hasattr(b, 'stochastic_depth'):
+                        b.stochastic_depth.p = rates[i]
+                    i += 1
         except Exception:
             pass
 
-    def forward(self, images: torch.Tensor, features: torch.Tensor):
-        images   = torch.nan_to_num(images,   nan=0.0, posinf=1.0,  neginf=-1.0)
-        features = torch.nan_to_num(features, nan=0.0, posinf=0.0,  neginf=0.0)
+    # ── Forward ───────────────────────────────────────────────────────────
+    def forward(
+        self,
+        images:         torch.Tensor,
+        features:       torch.Tensor,
+        return_ordinal: bool = True,
+    ):
+        """
+        Args:
+            images        : FloatTensor [B, 3, 300, 300]
+            features      : FloatTensor [B, 31]
+            return_ordinal: if True  → return (logits, ord_logits)
+                            if False → return logits only
+        """
+        images   = torch.nan_to_num(images,   nan=0., posinf=1.,  neginf=-1.)
+        features = torch.nan_to_num(features, nan=0., posinf=0.,  neginf=0.)
 
-        cnn_feat  = self.backbone(images)
-        cnn_feat  = torch.nan_to_num(cnn_feat,  nan=0.0, posinf=1e3, neginf=-1e3)
-        trad_feat = self.feature_mlp(features)
-        trad_feat = torch.nan_to_num(trad_feat, nan=0.0, posinf=1e3, neginf=-1e3)
+        cnn  = torch.nan_to_num(self.backbone(images),
+                                nan=0., posinf=1e3, neginf=-1e3)
+        feat = torch.nan_to_num(self.feat_mlp(features),
+                                nan=0., posinf=1e3, neginf=-1e3)
 
-        fused = torch.cat([cnn_feat, trad_feat], dim=1)
-        attn  = self.attention(fused)
+        fused  = self.se(torch.cat([cnn, feat], dim=1))
+        logits = self.head(fused)
 
-        fused_scaled = torch.cat(
-            [cnn_feat * attn[:, 0:1], trad_feat * attn[:, 1:2]], dim=1
-        )
-        return self.classifier(fused_scaled), attn
+        if return_ordinal:
+            return logits, self.ordinal_head(fused)
+        return logits
 
 
-# ---------------------------------------------------------------------------
-# Public helpers
-# ---------------------------------------------------------------------------
+# ── Public helpers ────────────────────────────────────────────────────────────
+
 def create_hybrid_model(
-    num_classes:              int   = 5,
-    num_traditional_features: int   = 30,
-    feat_out_dim:             int   = 128,
-    mlp_hidden1:              int   = 256,
-    mlp_hidden2:              int   = 256,
-    attn_hidden:              int   = 64,
-    attn_dropout:             bool  = False,
-    dropout:                  float = 0.5,
-    drop_path_rate:           float = 0.2,
-    device:                   str   = "cpu",
+    num_classes:    int   = 4,
+    num_features:   int   = NUM_FEATURES,
+    feat_dim:       int   = FEAT_DIM,
+    dropout:        float = 0.5,
+    drop_path_rate: float = 0.4,
+    device:         str   = 'cpu',
 ) -> EfficientNetHybrid:
+    """
+    Instantiate and print an EfficientNetHybrid.
+    Defaults match the values used in train_hybrid.py's build_model() call:
+      dropout=0.5, dpr=0.4
+    """
     model = EfficientNetHybrid(
         num_classes    = num_classes,
-        num_features   = num_traditional_features,
-        feat_out_dim   = feat_out_dim,
-        mlp_hidden1    = mlp_hidden1,
-        mlp_hidden2    = mlp_hidden2,
-        attn_hidden    = attn_hidden,
-        attn_dropout   = attn_dropout,
+        num_features   = num_features,
+        feat_dim       = feat_dim,
         dropout        = dropout,
         drop_path_rate = drop_path_rate,
     ).to(device)
 
     n = sum(p.numel() for p in model.parameters())
     t = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    fusion = 1536 + feat_out_dim
-    print(f"\nHybrid Model created:")
-    print(f"  FeatureMLP  : {num_traditional_features}->{mlp_hidden1}->{mlp_hidden2}->{feat_out_dim}")
-    print(f"  fusion_dim  : 1536 + {feat_out_dim} = {fusion}")
-    print(f"  attn_hidden : {attn_hidden}  attn_dropout={attn_dropout}")
-    print(f"  Total params: {n:,}  ({n*4/1024/1024:.1f} MB)  trainable: {t:,}")
+    fusion = model.cnn_dim + feat_dim
+    print(f"\nEfficientNetHybrid v11 created:")
+    print(f"  FeatureMLP  : {num_features} → 256 → 256 → {feat_dim}  (gate-gated)")
+    print(f"  fusion_dim  : {model.cnn_dim} + {feat_dim} = {fusion}")
+    print(f"  head        : {fusion} → 512 → 256 → {num_classes}")
+    print(f"  ordinal_head: {fusion} → 128 → {num_classes - 1}")
+    print(f"  Total params: {n:,}  ({n * 4 / 1024 / 1024:.1f} MB)  trainable: {t:,}")
     print(f"  Device      : {device}  classes: {num_classes}")
     return model
 
 
 def load_hybrid_model(
     checkpoint_path: str,
-    device:          str   = "cpu",
-    dropout:         float = 0.5,
-    drop_path_rate:  float = 0.2,
+    device:          str = 'cpu',
 ) -> EfficientNetHybrid:
-    """Thin wrapper -- delegates to load_model.py for full dim-inference."""
+    """Thin wrapper — delegates to load_model.py for full dim-inference."""
     import importlib, sys
     from pathlib import Path
     _here = Path(__file__).resolve().parent
     if str(_here) not in sys.path:
         sys.path.insert(0, str(_here))
-    lm = importlib.import_module("load_model")
+    lm = importlib.import_module('load_model')
     return lm.load_model(checkpoint_path, device=device)
 
 
-# ---------------------------------------------------------------------------
-# Smoke test
-# ---------------------------------------------------------------------------
-if __name__ == "__main__":
-    print("=" * 60)
-    print("Smoke-test: EfficientNetHybrid (checkpoint-verified dims)")
-    print("=" * 60)
+# ── Smoke test ────────────────────────────────────────────────────────────────
 
-    model = create_hybrid_model(num_classes=5, device="cpu")
+if __name__ == '__main__':
+    print('=' * 60)
+    print('Smoke-test: EfficientNetHybrid v11')
+    print(f'  NUM_FEATURES={NUM_FEATURES}  INPUT_SIZE={INPUT_SIZE}')
+    print(f'  SEVERITY_ORDER={SEVERITY_ORDER}')
+    print('=' * 60)
+
+    model = create_hybrid_model(num_classes=4, device='cpu')
     model.eval()
 
-    with torch.no_grad():
-        logits, attn = model(torch.randn(2, 3, 300, 300), torch.randn(2, 30))
+    imgs  = torch.randn(2, 3, INPUT_SIZE, INPUT_SIZE)
+    feats = torch.randn(2, NUM_FEATURES)
 
-    assert logits.shape == (2, 5)
-    assert attn.shape   == (2, 2)
+    with torch.no_grad():
+        logits, ord_logits = model(imgs, feats, return_ordinal=True)
+        logits_only        = model(imgs, feats, return_ordinal=False)
+
+    assert logits.shape      == (2, 4),  f"logits shape {logits.shape}"
+    assert ord_logits.shape  == (2, 3),  f"ord_logits shape {ord_logits.shape}"
+    assert logits_only.shape == (2, 4),  f"logits_only shape {logits_only.shape}"
     assert torch.isfinite(logits).all()
-    assert torch.isfinite(attn).all()
+    assert torch.isfinite(ord_logits).all()
 
     sd = model.state_dict()
     checks = {
-        "feature_mlp.net.0.weight": (256, 30),   # Linear(30->256)
-        "feature_mlp.net.4.weight": (256, 256),  # Linear(256->256)
-        "feature_mlp.net.8.weight": (128, 256),  # Linear(256->128)
-        "feature_mlp.net.9.weight": (128,),       # BN(128)
-        "feature_mlp.proj.weight":  (128, 30),   # proj
-        "attention.0.weight":       (64, 1664),
-        "attention.2.weight":       (2,  64),
-        "classifier.1.weight":      (512, 1664),
-        "classifier.5.weight":      (5,   512),
+        # FeatureMLP
+        'feat_mlp.net.0.weight':      (256, NUM_FEATURES),
+        'feat_mlp.net.4.weight':      (256, 256),
+        'feat_mlp.net.8.weight':      (FEAT_DIM, 256),
+        'feat_mlp.net.9.weight':      (FEAT_DIM,),
+        'feat_mlp.gate.0.weight':     (32, NUM_FEATURES),
+        'feat_mlp.gate.2.weight':     (1, 32),
+        # ChannelSE
+        'se.fc.0.weight':             (max(8, FUSION_DIM // 16), FUSION_DIM),
+        'se.fc.2.weight':             (FUSION_DIM, max(8, FUSION_DIM // 16)),
+        # Classification head
+        'head.1.weight':              (512, FUSION_DIM),
+        'head.5.weight':              (256, 512),
+        'head.9.weight':              (4,   256),
+        # Ordinal head
+        'ordinal_head.1.weight':      (128, FUSION_DIM),
+        'ordinal_head.3.weight':      (3,   128),
     }
+
     all_ok = True
     for key, exp in checks.items():
         act = tuple(sd[key].shape)
         ok  = act == exp
         all_ok = all_ok and ok
-        print(f"  {'OK' if ok else 'FAIL'} {key}: {act}")
+        print(f"  {'OK  ' if ok else 'FAIL'} {key}: got {act}"
+              + ('' if ok else f'  expected {exp}'))
 
-    print(f"\nForward OK: logits={logits.shape}  attn={attn.shape}")
-    print("All checks passed." if all_ok else "SOME CHECKS FAILED.")
+    print(f'\nForward OK:')
+    print(f'  logits      : {logits.shape}')
+    print(f'  ord_logits  : {ord_logits.shape}')
+    print(f'  logits_only : {logits_only.shape}')
+    print('All checks passed.' if all_ok else '\n❌  SOME CHECKS FAILED.')
