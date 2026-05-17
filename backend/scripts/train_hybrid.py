@@ -45,9 +45,9 @@ CNN_DIM       = 1536
 FUSION_DIM    = CNN_DIM + FEAT_DIM
 
 FREEZE_EPOCHS  = 10
-UNFREEZE_STEP  = 20
-ORDINAL_WEIGHT = 0.3
-CE_WEIGHT      = 0.7
+UNFREEZE_STEP  = 5
+ORDINAL_WEIGHT = 0.5
+CE_WEIGHT      = 0.5
 
 SEVERITY_ORDER = ['Normal', 'CIN1', 'HighGrade', 'Cancer']
 HARD_CLASSES   = {'HighGrade', 'Cancer', 'Normal', 'CIN1'}
@@ -92,11 +92,17 @@ class OrdinalLoss(nn.Module):
             dist[:, k-1] = torch.abs(targets.float() - k)
         scale = 1. - self.s * (1. / (1. + dist))
         bt = bt * scale + (1 - bt) * (1 - scale)
-        return F.binary_cross_entropy_with_logits(logits, bt)
+        
+        # Under-prediction penalty: if true severity k but pred < k, weight 2×
+        bce = F.binary_cross_entropy_with_logits(logits, bt, reduction='none')
+        preds = (torch.sigmoid(logits) > 0.5).float()
+        under_pred = (preds < bt).float()
+        bce = bce * (1.0 + under_pred * 1.0)  # Under-predictions weighted 2×
+        return bce.mean()
 
 
 class FocalLoss(nn.Module):
-    def __init__(self, gamma=1.0, smoothing=0.08, num_classes=4):
+    def __init__(self, gamma=2.0, smoothing=0.08, num_classes=4):
         super().__init__()
         self.gamma = gamma
         self.s = smoothing
@@ -343,7 +349,15 @@ def cutmix_fn(images, features, labels, alpha=0.1):
 
 
 def get_aug_params(epoch):
-    return False, False, 0.
+    # Start MixUp early (ep 5), CutMix after (ep 15)
+    # Alpha peaks at 0.15 by epoch 40, then decays
+    if epoch < 5:
+        return False, False, 0.
+    use_mix = epoch >= 5
+    use_cut = epoch >= 15
+    # Alpha: ramp 0.02→0.15 over eps 5-40, then hold
+    alpha = min(0.15, 0.02 + 0.003*(epoch-5)) if epoch < 40 else 0.15
+    return use_mix, use_cut, alpha
 
 
 class WarmCosine:
@@ -631,7 +645,7 @@ def train(data_dir, output_dir, epochs=50, batch_size=32,
     hard_idx = {cls.index(c) for c in HARD_CLASSES if c in cls}
     def sample_weight(l):
         name = cls[l]
-        if name == 'CIN1':    return (1./tc[l]) * 5.
+        if name == 'CIN1':    return (1./tc[l]) * 8.    # 8× instead of 5× (vs HighGrade)
         if name in HARD_CLASSES: return (1./tc[l]) * 3.
         return 1./tc[l]
     sw = [sample_weight(l) for l in tr_l]
@@ -701,7 +715,7 @@ def train(data_dir, output_dir, epochs=50, batch_size=32,
             print("⚠️  No checkpoint found — starting from scratch")
 
     # ── Loss / AMP / SWA ──────────────────────────────────────────────────
-    ce_fn  = FocalLoss(gamma=1.0, smoothing=0.08, num_classes=len(cls))
+    ce_fn  = FocalLoss(gamma=2.0, smoothing=0.08, num_classes=len(cls))
     ord_fn = OrdinalLoss(num_classes=len(cls), smoothing=0.05)
     amp_scaler = torch.cuda.amp.GradScaler() if torch.cuda.is_available() else None
     swa_model  = AveragedModel(model) if USE_SWA else None
@@ -733,22 +747,19 @@ def train(data_dir, output_dir, epochs=50, batch_size=32,
             new_bb = [p for p in model.backbone.parameters() if p.requires_grad]
             opt.add_param_group({
                 'params': new_bb,
-                'lr': lr * 0.005,
+                'lr': lr * 0.1,          # 1e-5 instead of 5e-7 (20× stronger)
                 'weight_decay': 1e-4,
                 'frozen_lr': True,
             })
+            print(f"  ✅ Backbone group added (bb_lr={lr*0.1:.1e})")
+
             remaining = max(60, epochs - ep)
             sch = WarmCosine(opt, warmup=2, total=remaining, min_frac=0.20)
             for pg in opt.param_groups:
                 if not pg.get('frozen_lr', False):
                     pg['lr']      = lr * 0.5
                     pg['base_lr'] = lr * 0.5
-
-            if USE_SWA:
-                swa_model = AveragedModel(model)
-                print("  ✅ SWA model reset after resume")
-
-            print(f"  ✅ Scheduler restarted, head_lr={lr*0.5:.1e}")
+            print(f"  ✅ Scheduler restarted, head_lr={lr*0.5:.1e}, bb_lr={lr*0.1:.1e}")
         elif unfrz and ep > FREEZE_EPOCHS:
             unfreeze_progressive(model, ep, FREEZE_EPOCHS)
             already = {id(p) for pg in opt.param_groups for p in pg['params']}
