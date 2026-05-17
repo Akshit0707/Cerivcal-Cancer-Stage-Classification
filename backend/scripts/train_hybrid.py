@@ -47,9 +47,9 @@ FUSION_DIM    = CNN_DIM + FEAT_DIM   # 1664
 FREEZE_EPOCHS  = 10
 UNFREEZE_STEP  = 5
 
-# FIX 4: constants now match the config printout (0.7 / 0.3)
-FOCAL_WEIGHT   = 0.7
-ORDINAL_WEIGHT = 0.3
+# Ordinal weight raised 0.3→0.4: penalises CIN1↔HighGrade boundary errors more
+FOCAL_WEIGHT   = 0.6
+ORDINAL_WEIGHT = 0.4
 
 # FIX 1: single source of truth for augmentation schedule
 MIXUP_START  = 5    # epoch index (0-based) when MixUp begins
@@ -58,8 +58,9 @@ CUTMIX_START = 15   # epoch index when CutMix begins
 SEVERITY_ORDER = ['Normal', 'CIN1', 'HighGrade', 'Cancer']
 HARD_CLASSES   = {'HighGrade', 'Cancer', 'Normal', 'CIN1'}
 
-# FIX 3: sampler weight constants in one place, matches sample_weight()
-CIN1_WEIGHT = 8.    # CIN1 oversampled 8× (harder boundary with HighGrade)
+# CIN1_WEIGHT dropped 8→4: at ep24 the 8× was collapsing HighGrade into CIN1
+# (127/230 HighGrade predicted as CIN1). Model is strong enough now.
+CIN1_WEIGHT = 4.    # CIN1 oversampled 4×
 HARD_WEIGHT = 3.    # other hard classes 3×
 
 SCRIPT_PATH = Path(__file__).resolve()
@@ -111,11 +112,16 @@ class OrdinalLoss(nn.Module):
 
 
 class FocalLoss(nn.Module):
-    def __init__(self, gamma=2.0, smoothing=0.08, num_classes=4):
+    def __init__(self, gamma=2.0, smoothing=0.08, num_classes=4,
+                 class_gamma=None):
         super().__init__()
         self.gamma = gamma
         self.s = smoothing
         self.K = num_classes
+        # class_gamma: per-class gamma override tensor (length = num_classes).
+        # Higher gamma = more focus on hard examples for that class.
+        # Default None = uniform gamma for all classes.
+        self.class_gamma = class_gamma  # e.g. tensor([2,2,3,2]) boosts HighGrade
 
     def forward(self, logits, targets):
         logits = torch.clamp(logits, -50., 50.)
@@ -125,7 +131,11 @@ class FocalLoss(nn.Module):
         log_p = F.log_softmax(logits, -1)
         ce = -(sm*log_p).sum(-1)
         pt = F.softmax(logits,-1).gather(1, targets.unsqueeze(1)).squeeze(1)
-        return ((1-pt)**self.gamma * ce).mean()
+        if self.class_gamma is not None:
+            gamma = self.class_gamma.to(logits.device)[targets]
+        else:
+            gamma = self.gamma
+        return ((1-pt)**gamma * ce).mean()
 
 
 class ChannelSE(nn.Module):
@@ -684,7 +694,16 @@ def train(data_dir, output_dir, epochs=50, batch_size=32,
     sch = WarmCosine(opt, warmup=3, total=epochs, min_frac=0.05)
 
     # ── Loss / AMP ────────────────────────────────────────────────────────
-    ce_fn  = FocalLoss(gamma=2.0, smoothing=0.08, num_classes=len(cls))
+    # Per-class gamma: HighGrade (idx=2 in SEVERITY_ORDER) gets gamma=3.0
+    # to force harder focus on its misclassified examples (127/230 lost to
+    # CIN1 at ep24). Falls back to uniform gamma if class order differs.
+    _default_gamma = 2.0
+    _class_gamma = (
+        torch.tensor([2.0, 2.0, 3.0, 2.0])  # Normal / CIN1 / HighGrade / Cancer
+        if cls == SEVERITY_ORDER else None
+    )
+    ce_fn  = FocalLoss(gamma=_default_gamma, smoothing=0.08, num_classes=len(cls),
+                       class_gamma=_class_gamma)
     ord_fn = OrdinalLoss(num_classes=len(cls), smoothing=0.05)
     amp_scaler = torch.cuda.amp.GradScaler() if torch.cuda.is_available() else None
 
