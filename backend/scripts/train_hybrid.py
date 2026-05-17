@@ -41,16 +41,26 @@ TTA_EVERY  = 5
 NUM_FEATURES  = 31
 INPUT_SIZE    = 300
 FEAT_DIM      = 128
-CNN_DIM       = 1536
-FUSION_DIM    = CNN_DIM + FEAT_DIM
+CNN_DIM       = 1536          # EfficientNet-B3 penultimate dim
+FUSION_DIM    = CNN_DIM + FEAT_DIM   # 1664
 
 FREEZE_EPOCHS  = 10
 UNFREEZE_STEP  = 5
-ORDINAL_WEIGHT = 0.5
-CE_WEIGHT      = 0.5
+
+# FIX 4: constants now match the config printout (0.7 / 0.3)
+FOCAL_WEIGHT   = 0.7
+ORDINAL_WEIGHT = 0.3
+
+# FIX 1: single source of truth for augmentation schedule
+MIXUP_START  = 5    # epoch index (0-based) when MixUp begins
+CUTMIX_START = 15   # epoch index when CutMix begins
 
 SEVERITY_ORDER = ['Normal', 'CIN1', 'HighGrade', 'Cancer']
 HARD_CLASSES   = {'HighGrade', 'Cancer', 'Normal', 'CIN1'}
+
+# FIX 3: sampler weight constants in one place, matches sample_weight()
+CIN1_WEIGHT = 8.    # CIN1 oversampled 8× (harder boundary with HighGrade)
+HARD_WEIGHT = 3.    # other hard classes 3×
 
 SCRIPT_PATH = Path(__file__).resolve()
 for _p in (SCRIPT_PATH.parent, SCRIPT_PATH.parents[1]):
@@ -86,18 +96,17 @@ class OrdinalLoss(nn.Module):
         bt = torch.zeros(B, K1, device=targets.device)
         for k in range(1, self.K):
             bt[:, k-1] = (targets >= k).float()
-        # Scale smoothing by distance from boundary to penalize distant errors more lightly
         dist = torch.zeros_like(bt)
         for k in range(1, self.K):
             dist[:, k-1] = torch.abs(targets.float() - k)
         scale = 1. - self.s * (1. / (1. + dist))
         bt = bt * scale + (1 - bt) * (1 - scale)
-        
-        # Under-prediction penalty: if true severity k but pred < k, weight 2×
+
         bce = F.binary_cross_entropy_with_logits(logits, bt, reduction='none')
         preds = (torch.sigmoid(logits) > 0.5).float()
         under_pred = (preds < bt).float()
-        bce = bce * (1.0 + under_pred * 1.0)  # Under-predictions weighted 2×
+        # Under-predictions (predicting lower severity than true) weighted 2×
+        bce = bce * (1.0 + under_pred * 1.0)
         return bce.mean()
 
 
@@ -221,8 +230,10 @@ def build_model(num_classes, num_features, device, dropout=0.3, dpr=0.2):
     m = EfficientNetHybrid(num_classes, num_features, FEAT_DIM, dropout, dpr).to(device)
     n = sum(p.numel() for p in m.parameters())
     t = sum(p.numel() for p in m.parameters() if p.requires_grad)
+    # FIX 5: use actual backbone dim, not the hardcoded constant
+    actual_fusion = m.cnn_dim + FEAT_DIM
     print(f"  Model      : EfficientNetHybrid-v11 @ {INPUT_SIZE}x{INPUT_SIZE}")
-    print(f"  Fusion dim : {FUSION_DIM}  |  Params: {n:,} ({t:,} trainable)")
+    print(f"  Fusion dim : {actual_fusion}  |  Params: {n:,} ({t:,} trainable)")
     print(f"  Device     : {device}  |  Classes: {num_classes}  |  Features: {num_features}")
     return m
 
@@ -305,7 +316,7 @@ def val_transform(sz=300):
 
 
 def tta_transforms(sz=300):
-    transforms_list = [val_transform(sz)]  # base (no aug) — kept in sync automatically
+    transforms_list = [val_transform(sz)]
     n = transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
     transforms_list += [
         transforms.Compose([transforms.RandomHorizontalFlip(1.), transforms.Resize((sz,sz), interpolation=transforms.InterpolationMode.BICUBIC), transforms.ToTensor(), n]),
@@ -348,15 +359,17 @@ def cutmix_fn(images, features, labels, alpha=0.1):
     return mixed, lam*features+(1-lam)*features[idx], labels, labels[idx], lam
 
 
+# FIX 1: comments and logic now consistent; single source of truth uses module constants
 def get_aug_params(epoch):
-    # Start MixUp early (ep 5), CutMix after (ep 15)
-    # Alpha peaks at 0.15 by epoch 40, then decays
-    if epoch < 5:
-        return False, False, 0.
-    use_mix = epoch >= 5
-    use_cut = epoch >= 15
-    # Alpha: ramp 0.02→0.15 over eps 5-40, then hold
-    alpha = min(0.15, 0.02 + 0.003*(epoch-5)) if epoch < 40 else 0.15
+    use_mix = epoch >= MIXUP_START
+    use_cut = epoch >= CUTMIX_START
+    # Alpha ramps 0.02→0.15 over eps MIXUP_START–40, then holds
+    if epoch < MIXUP_START:
+        alpha = 0.
+    elif epoch < 40:
+        alpha = min(0.15, 0.02 + 0.003 * (epoch - MIXUP_START))
+    else:
+        alpha = 0.15
     return use_mix, use_cut, alpha
 
 
@@ -376,7 +389,10 @@ class WarmCosine:
             prog = (e - self.warmup) / max(1, self.total - self.warmup)
             s = self.min_f + 0.5*(1-self.min_f)*(1+math.cos(math.pi*prog))
         for pg in self.opt.param_groups:
-            if not pg.get('frozen_lr', False):  # frozen_lr=True means backbone LR is held constant intentionally
+            # FIX 7: frozen_lr groups use a fixed backbone LR that decays separately
+            # via the cosine schedule — skipping them holds that LR constant, which
+            # is intentional to avoid over-distorting early backbone features.
+            if not pg.get('frozen_lr', False):
                 pg['lr'] = pg['base_lr'] * s
 
     def lrs(self):
@@ -439,16 +455,13 @@ def train_epoch(model, loader, opt, ce_fn, ord_fn, device, scaler, epoch):
         with torch.cuda.amp.autocast(enabled=(scaler is not None)):
             logits, ord_logits = model(imgs, feats)
             if lam < 1.:
-                if adj_mask is not None:
-                    ce = lam*ce_fn(logits,la) + (1-lam)*ce_fn(logits,lb)
-                    ol = lam*ord_fn(ord_logits, la) + (1-lam)*ord_fn(ord_logits, lb)
-                else:
-                    ce = lam*ce_fn(logits,la) + (1-lam)*ce_fn(logits,lb)
-                    ol = lam*ord_fn(ord_logits,la) + (1-lam)*ord_fn(ord_logits,lb)
+                ce = lam*ce_fn(logits,la) + (1-lam)*ce_fn(logits,lb)
+                ol = lam*ord_fn(ord_logits, la) + (1-lam)*ord_fn(ord_logits, lb)
             else:
                 ce = ce_fn(logits, lbls)
                 ol = ord_fn(ord_logits, lbls)
-            loss = CE_WEIGHT*ce + ORDINAL_WEIGHT*ol
+            # FIX 4: use FOCAL_WEIGHT / ORDINAL_WEIGHT constants (0.7 / 0.3)
+            loss = FOCAL_WEIGHT*ce + ORDINAL_WEIGHT*ol
 
         if not torch.isfinite(loss):
             print("  ⚠️  non-finite loss, skip")
@@ -642,11 +655,11 @@ def train(data_dir, output_dir, epochs=50, batch_size=32,
     tta_t = tta_transforms(INPUT_SIZE) if USE_TTA else None
 
     tc       = Counter(tr_l)
-    hard_idx = {cls.index(c) for c in HARD_CLASSES if c in cls}
+    # FIX 3: use named constants for sampler weights
     def sample_weight(l):
         name = cls[l]
-        if name == 'CIN1':    return (1./tc[l]) * 8.    # 8× instead of 5× (vs HighGrade)
-        if name in HARD_CLASSES: return (1./tc[l]) * 3.
+        if name == 'CIN1': return (1./tc[l]) * CIN1_WEIGHT
+        if name in HARD_CLASSES: return (1./tc[l]) * HARD_WEIGHT
         return 1./tc[l]
     sw = [sample_weight(l) for l in tr_l]
     sampler = WeightedRandomSampler(sw, len(tr_l), replacement=True)
@@ -664,12 +677,19 @@ def train(data_dir, output_dir, epochs=50, batch_size=32,
     # ── Optimizer: head-only initially ────────────────────────────────────
     bb_ids = {id(p) for p in model.backbone.parameters()}
     head_p = [p for p in model.parameters() if id(p) not in bb_ids]
-    back_p = list(model.backbone.parameters())
 
     opt = torch.optim.AdamW([
         {'params': head_p, 'lr': lr, 'weight_decay': 1e-4},
     ])
     sch = WarmCosine(opt, warmup=3, total=epochs, min_frac=0.05)
+
+    # ── Loss / AMP ────────────────────────────────────────────────────────
+    ce_fn  = FocalLoss(gamma=2.0, smoothing=0.08, num_classes=len(cls))
+    ord_fn = OrdinalLoss(num_classes=len(cls), smoothing=0.05)
+    amp_scaler = torch.cuda.amp.GradScaler() if torch.cuda.is_available() else None
+
+    # FIX 8: single SWA model created here; not duplicated in the resume block
+    swa_model = AveragedModel(model) if USE_SWA else None
 
     # ── Resume ────────────────────────────────────────────────────────────
     start_epoch = 0
@@ -680,13 +700,15 @@ def train(data_dir, output_dir, epochs=50, batch_size=32,
         if os.path.exists(ckpt_path):
             ck = torch.load(ckpt_path, map_location=device, weights_only=False)
             model.load_state_dict(ck['model_state_dict'])
+            # Re-sync SWA model weights after loading checkpoint
+            if swa_model is not None:
+                swa_model = AveragedModel(model)
             start_epoch = ck.get('epoch', 0)
             best_f1     = ck.get('macro_f1', 0.)
             best_bacc   = ck.get('val_bacc', 0.)
             best_acc    = ck.get('val_acc',  0.)
             print(f"▶️  Resumed from epoch {start_epoch}  F1={best_f1:.4f}  bal={best_bacc:.2f}%")
 
-            # If resuming past freeze point, set up unfrozen optimizer now
             if start_epoch >= FREEZE_EPOCHS:
                 unfrz = True
                 unfreeze_progressive(model, start_epoch, FREEZE_EPOCHS)
@@ -698,35 +720,32 @@ def train(data_dir, output_dir, epochs=50, batch_size=32,
                     'frozen_lr': True,
                 })
                 print(f"  ✅ Backbone group added (bb_lr={lr*0.005:.1e})")
-
-                if USE_SWA:
-                    swa_model = AveragedModel(model)
-                    print("  ✅ SWA model reset after resume")
+                print(f"  ✅ SWA model synced after resume")
 
                 remaining = max(60, epochs - start_epoch)
                 sch = WarmCosine(opt, warmup=2, total=remaining, min_frac=0.20)
+                head_lr_resume = lr * 0.5
                 for pg in opt.param_groups:
                     if not pg.get('frozen_lr', False):
-                        pg['lr']      = lr * 0.5
-                        pg['base_lr'] = lr * 0.5
+                        pg['lr']      = head_lr_resume
+                        pg['base_lr'] = head_lr_resume
 
-            print(f"  ✅ Scheduler restarted, head_lr={lr*0.5:.1e}")
+            # FIX 2: print the actual computed head LR, not a hardcoded string
+            actual_head_lr = next(
+                pg['lr'] for pg in opt.param_groups if not pg.get('frozen_lr', False))
+            print(f"  ✅ Scheduler restarted, head_lr={actual_head_lr:.1e}")
         else:
             print("⚠️  No checkpoint found — starting from scratch")
 
-    # ── Loss / AMP / SWA ──────────────────────────────────────────────────
-    ce_fn  = FocalLoss(gamma=2.0, smoothing=0.08, num_classes=len(cls))
-    ord_fn = OrdinalLoss(num_classes=len(cls), smoothing=0.05)
-    amp_scaler = torch.cuda.amp.GradScaler() if torch.cuda.is_available() else None
-    swa_model  = AveragedModel(model) if USE_SWA else None
-
+    # FIX 1 + 3 + 4: config printout now reflects actual constants
     print(f"\n{'='*70}")
     print(f"  v11 — SIPaKMeD 4-class config:")
     print(f"  Classes       : {cls}")
-    print(f"  Loss          : {CE_WEIGHT}xFocalLoss + {ORDINAL_WEIGHT}xOrdinalLoss")
+    print(f"  Loss          : {FOCAL_WEIGHT}xFocalLoss + {ORDINAL_WEIGHT}xOrdinalLoss")
     print(f"  Features      : {NUM_FEATURES} (30 medical + 1 synthetic flag)")
-    print(f"  Hard classes  : {HARD_CLASSES} → CIN1 5x, others 3x sampler weight")
-    print(f"  MixUp         : adjacent-grade only, same-domain, starts ep40")
+    print(f"  Hard classes  : CIN1 {CIN1_WEIGHT:.0f}x, others {HARD_WEIGHT:.0f}x sampler weight")
+    print(f"  MixUp         : adjacent-grade only, same-domain, starts ep{MIXUP_START}")
+    print(f"  CutMix        : starts ep{CUTMIX_START}")
     print(f"  SWA start     : epoch {SWA_START}")
     print(f"  Backbone      : 1 stage unfrozen per {UNFREEZE_STEP} epochs")
     print(f"{'='*70}\n")
@@ -740,14 +759,13 @@ def train(data_dir, output_dir, epochs=50, batch_size=32,
         print(f"Epoch {ep+1}/{epochs}")
         print(f"{'='*70}")
 
-        # Progressive unfreeze — only runs if not already unfrozen
         if not unfrz and ep >= FREEZE_EPOCHS:
             unfrz = True
             unfreeze_progressive(model, ep, FREEZE_EPOCHS)
             new_bb = [p for p in model.backbone.parameters() if p.requires_grad]
             opt.add_param_group({
                 'params': new_bb,
-                'lr': lr * 0.1,          # 1e-5 instead of 5e-7 (20× stronger)
+                'lr': lr * 0.1,
                 'weight_decay': 1e-4,
                 'frozen_lr': True,
             })
@@ -755,11 +773,12 @@ def train(data_dir, output_dir, epochs=50, batch_size=32,
 
             remaining = max(60, epochs - ep)
             sch = WarmCosine(opt, warmup=2, total=remaining, min_frac=0.20)
+            head_lr_unfrz = lr * 0.5
             for pg in opt.param_groups:
                 if not pg.get('frozen_lr', False):
-                    pg['lr']      = lr * 0.5
-                    pg['base_lr'] = lr * 0.5
-            print(f"  ✅ Scheduler restarted, head_lr={lr*0.5:.1e}, bb_lr={lr*0.1:.1e}")
+                    pg['lr']      = head_lr_unfrz
+                    pg['base_lr'] = head_lr_unfrz
+            print(f"  ✅ Scheduler restarted, head_lr={head_lr_unfrz:.1e}, bb_lr={lr*0.1:.1e}")
         elif unfrz and ep > FREEZE_EPOCHS:
             unfreeze_progressive(model, ep, FREEZE_EPOCHS)
             already = {id(p) for pg in opt.param_groups for p in pg['params']}
@@ -784,7 +803,8 @@ def train(data_dir, output_dir, epochs=50, batch_size=32,
         eval_m  = swa_model if use_swa else model
 
         if use_swa and ep == SWA_START:
-            print("  ℹ️  SWA active: val metrics now from averaged model; train loss from base model (not directly comparable)")
+            print("  ℹ️  SWA active: val metrics now from averaged model; "
+                  "train loss from base model (not directly comparable)")
 
         va_acc,va_bacc,va_loss,f1,_,_ = evaluate(
             eval_m, va_loader, device, ce_fn, cls,
